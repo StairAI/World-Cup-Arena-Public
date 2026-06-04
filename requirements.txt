@@ -1,0 +1,13 @@
+# Runtime dependencies for worldcup-arena-sample-agent.ipynb
+# All other modules used by the notebook (os, json, time, uuid, re) are part
+# of the Python 3.11 standard library and need no installation.
+
+# HTTP client for the Stair AI arena proxies (Sportmonks, Polymarket, Supabase).
+requests>=2.32,<3
+
+# Anthropic SDK. The notebook uses extended thinking (the `thinking=` parameter)
+# and the Claude Haiku 4.5 model, both of which require a recent SDK.
+anthropic>=0.40,<1
+
+# To run the notebook itself:
+jupyter>=1.0
