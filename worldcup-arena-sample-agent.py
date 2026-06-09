@@ -68,13 +68,13 @@ ARENA            = "https://staging.stair-ai.com"
 SPORTMONKS_PROXY = f"{ARENA}/api/v1/data/proxy/sportmonks/v3/football"
 POLYMARKET_CLOB  = f"{ARENA}/api/v1/data/proxy/polymarket-clob"
 POLYMARKET_GAMMA = f"{ARENA}/api/v1/data/proxy/polymarket-gamma"
-ARENA_KEY        = "FILL IN YOUR ARENA KEY"
+ARENA_KEY        = "FILL IN YOUR ARENA KEY HERE"   # mint at https://staging.stair-ai.com/api-keys
 # Staging shares a single publishable Supabase key for every builder — no
 # per-account JWT, no extra setup. The arena will publish these two values
 # alongside the API key minted in the portal.
 SUPABASE         = "https://ezvbmtvrvzageqixvdak.supabase.co"
 SUPABASE_KEY     = "sb_publishable__m8bOkD05ToFwATpaWST5w_2-3fGS7V"
-ANTHROPIC_KEY    = "FILL IN YOUR ANTHROPIC KEY"
+ANTHROPIC_KEY    = "FILL IN YOUR ANTHROPIC KEY HERE"   # get one at https://console.anthropic.com
 
 # --- Other LLM providers (OPTIONAL) ------------------------------------------
 # This notebook calls Anthropic by default. To use a DIFFERENT provider instead:
@@ -608,7 +608,7 @@ print(json.dumps(polymarket_digest, indent=2))
 # | **4c · Fetch** | Pull the priors rows we want for both teams |
 # | **4d · Digest** | Have Claude summarize them into JSON for Step 5 |
 #
-# ⚠️ **Heads-up — team identifiers differ between systems.** Sportmonks gives us a `team_id` per participant (Mexico = 458, South Africa = 146), but the StatsBomb-derived tables in this database use a separate `country_id` (Mexico = 147, South Africa = 211). Sub-step 4b bridges the two by joining on country name via the `dim_country` table — so the rest of the notebook never has to hard-code ids.
+# ⚠️ **Heads-up — team identifiers differ between systems.** Sportmonks gives us a `team_id` per participant (Mexico = 458, South Africa = 146), but the StatsBomb-derived tables in this database use a separate `country_id` (Mexico = 147, South Africa = 211). Sub-step 4b bridges them with a direct `team_id`-keyed lookup in the `dim_country` table — so the rest of the notebook never has to hard-code ids.
 
 # In[49]:
 
@@ -672,12 +672,9 @@ print(f"\nFor this walkthrough we'll pull stats from: {WANTED_TABLE}")
 #
 # The Sportmonks side gives us a `team_id` per participant; the priors tables
 # we're about to query are keyed on a separate `country_id`. `dim_country` in the
-# `world_cup_arena` schema is the bridge.
-#
-# Today the join is by **country_name** (for national teams, the team name on
-# Sportmonks matches `dim_country.country_name` exactly). A schema change to add
-# a `team_id` column to `dim_country` is in flight; once it lands, this lookup
-# becomes a direct `team_id=in.(…)` filter without the name hop.
+# `world_cup_arena` schema bridges them with a dedicated `team_id` column, so
+# we can filter directly by the Sportmonks ids and read back the matching
+# `country_id`s in one call — no name-string matching required.
 
 # In[50.5]:
 
@@ -685,18 +682,18 @@ print(f"\nFor this walkthrough we'll pull stats from: {WANTED_TABLE}")
 r = requests.get(
     f"{SUPABASE}/rest/v1/dim_country",
     params={
-        "select":       "country_id,country_name",
-        "country_name": f"in.({home['name']},{away['name']})",
+        "select":  "team_id,country_id,country_name",
+        "team_id": f"in.({home['id']},{away['id']})",
     },
     headers=H_WCA, timeout=10,
 )
 r.raise_for_status()
-country_rows    = r.json()
-country_by_name = {row["country_name"]: row["country_id"] for row in country_rows}
-COUNTRY_A_ID    = country_by_name.get(home["name"])
-COUNTRY_B_ID    = country_by_name.get(away["name"])
+country_rows       = r.json()
+country_by_team_id = {row["team_id"]: row["country_id"] for row in country_rows}
+COUNTRY_A_ID       = country_by_team_id.get(home["id"])
+COUNTRY_B_ID       = country_by_team_id.get(away["id"])
 
-print(f"HTTP {r.status_code} (OK) -- bridged {len(country_rows)} team(s) via country_name:")
+print(f"HTTP {r.status_code} (OK) -- bridged {len(country_rows)} team(s) via team_id:")
 print(f"  {home['name']:20s} (team_id {home['id']}) -> dim_country.country_id = {COUNTRY_A_ID}")
 print(f"  {away['name']:20s} (team_id {away['id']}) -> dim_country.country_id = {COUNTRY_B_ID}")
 
