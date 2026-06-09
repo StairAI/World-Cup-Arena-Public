@@ -599,28 +599,30 @@ print(json.dumps(polymarket_digest, indent=2))
 
 # ## Step 4 · Fetch historical team stats and summarize them
 
-# The arena also ships a **database** (Supabase) of deeper historical stats. We use it in three sub-steps:
-# 
+# The arena also ships a **database** (Supabase) of deeper historical stats. We use it in four sub-steps:
+#
 # | Sub-step | What it does |
 # |----------|--------------|
-# | **4a · Discover** | Read the catalog to learn which tables exist — no external docs needed |
-# | **4b · Fetch** | Pull the rows we want for both teams |
-# | **4c · Digest** | Have Claude summarize them into JSON for Step 5 |
-# 
-# ⚠️ **Heads-up — Team identifiers differ between systems.** In the arena, the id system is majorly identical to sportmonks, with which team_id is used. Sportmonks numbers Mexico = 458 / South Africa = 146, but this database (StatsBomb-derived) uses country_id and the numbers are **147 / 211**. Always use the id that matches the system you're querying.
+# | **4a · Discover** | Read the catalog to learn which tables and columns exist — no external docs needed |
+# | **4b · Bridge** | Map each team's Sportmonks `team_id` → StatsBomb `country_id` via `dim_country` |
+# | **4c · Fetch** | Pull the priors rows we want for both teams |
+# | **4d · Digest** | Have Claude summarize them into JSON for Step 5 |
+#
+# ⚠️ **Heads-up — team identifiers differ between systems.** Sportmonks gives us a `team_id` per participant (Mexico = 458, South Africa = 146), but the StatsBomb-derived tables in this database use a separate `country_id` (Mexico = 147, South Africa = 211). Sub-step 4b bridges the two by joining on country name via the `dim_country` table — so the rest of the notebook never has to hard-code ids.
 
 # In[49]:
 
 
-COUNTRY_A_ID = 147   # Mexico
-COUNTRY_B_ID = 211   # South Africa
-
 H_PUBLIC = {"apikey": SUPABASE_KEY}                                       # default schema = public
 H_WCA    = {"apikey": SUPABASE_KEY, "Accept-Profile": "world_cup_arena"}  # data layer
 
-print("Querying the Supabase stats DB. Heads-up: country ids differ from Sportmonks.")
-print(f"  Mexico       -> country_id {COUNTRY_A_ID}")
-print(f"  South Africa -> country_id {COUNTRY_B_ID}")
+# Sportmonks side: each participant exposes a team_id (`p["id"]`). The StatsBomb
+# tables under the world_cup_arena schema key on a different country_id, so we
+# resolve the bridge dynamically in 4b -- no hard-coded ids.
+print("Querying the Supabase stats DB. Sportmonks team_ids for this fixture:")
+print(f"  {home['name']:20s} (team_id {home['id']})")
+print(f"  {away['name']:20s} (team_id {away['id']})")
+print("Sub-step 4b will resolve each to its dim_country.country_id.")
 
 
 # ### 4a · Discover what data exists
@@ -641,7 +643,10 @@ print(f"  South Africa -> country_id {COUNTRY_B_ID}")
 r = requests.get(
     f"{SUPABASE}/rest/v1/catalog_full",
     params={
-        "select": "table_name,category,row_count,table_description",
+        # `columns` is a JSONB array on the view: [{column_name, data_type,
+        # description}, …]. Including it here means one round-trip yields the
+        # whole data dictionary -- table-level purpose + column-level meaning.
+        "select": "table_name,category,row_count,table_description,columns",
         "order":  "category,table_name",
     },
     headers=H_PUBLIC, timeout=10,
@@ -651,9 +656,10 @@ catalog = r.json()
 
 print(f"HTTP {r.status_code} (OK) -- the catalog lists every table available:\n")
 for t in catalog:
-    desc = (t.get("table_description") or "-").replace("\n", " ")[:60]
-    cat  = t.get("category") or "?"
-    print(f"  [{cat:11s}] {t['table_name']:30s}  rows={t['row_count']:>5d}  - {desc}")
+    desc   = (t.get("table_description") or "-").replace("\n", " ")[:60]
+    cat    = t.get("category") or "?"
+    n_cols = len(t.get("columns") or [])
+    print(f"  [{cat:11s}] {t['table_name']:30s}  rows={t['row_count']:>5d}  cols={n_cols:>2d}  - {desc}")
 
 # For this example we fetch ONE table, picked from the list above for its
 # playing-style indicators. A real agent could pull more (H2H, KO pattern,
@@ -662,8 +668,41 @@ WANTED_TABLE = "ads_a_country_style"
 print(f"\nFor this walkthrough we'll pull stats from: {WANTED_TABLE}")
 
 
-# ### 4b · Fetch the stats for both teams
-# 
+# ### 4b · Bridge Sportmonks team_id → StatsBomb country_id
+#
+# The Sportmonks side gives us a `team_id` per participant; the priors tables
+# we're about to query are keyed on a separate `country_id`. `dim_country` in the
+# `world_cup_arena` schema is the bridge.
+#
+# Today the join is by **country_name** (for national teams, the team name on
+# Sportmonks matches `dim_country.country_name` exactly). A schema change to add
+# a `team_id` column to `dim_country` is in flight; once it lands, this lookup
+# becomes a direct `team_id=in.(…)` filter without the name hop.
+
+# In[50.5]:
+
+
+r = requests.get(
+    f"{SUPABASE}/rest/v1/dim_country",
+    params={
+        "select":       "country_id,country_name",
+        "country_name": f"in.({home['name']},{away['name']})",
+    },
+    headers=H_WCA, timeout=10,
+)
+r.raise_for_status()
+country_rows    = r.json()
+country_by_name = {row["country_name"]: row["country_id"] for row in country_rows}
+COUNTRY_A_ID    = country_by_name.get(home["name"])
+COUNTRY_B_ID    = country_by_name.get(away["name"])
+
+print(f"HTTP {r.status_code} (OK) -- bridged {len(country_rows)} team(s) via country_name:")
+print(f"  {home['name']:20s} (team_id {home['id']}) -> dim_country.country_id = {COUNTRY_A_ID}")
+print(f"  {away['name']:20s} (team_id {away['id']}) -> dim_country.country_id = {COUNTRY_B_ID}")
+
+
+# ### 4c · Fetch the stats for both teams
+#
 # Now query the chosen table for just our two teams. Supabase uses PostgREST-style query params: `country_id=in.(147,211)` means "rows where country_id is 147 or 211," and `select=*` returns all columns. We send the `world_cup_arena` schema header so the request hits the arena's data tables.
 
 # In[51]:
@@ -671,7 +710,7 @@ print(f"\nFor this walkthrough we'll pull stats from: {WANTED_TABLE}")
 
 r = requests.get(
     f"{SUPABASE}/rest/v1/{WANTED_TABLE}",
-    params={"country_id": f"in.({TEAM_A_ID},{TEAM_B_ID})", "select": "*"},
+    params={"country_id": f"in.({COUNTRY_A_ID},{COUNTRY_B_ID})", "select": "*"},
     headers=H_WCA, timeout=10,
 )
 r.raise_for_status()
@@ -683,7 +722,7 @@ print("Raw rows (the full stats Claude will summarize next):\n")
 print(json.dumps(priors_rows, indent=2, default=str))
 
 
-# ### 4c · Summarize the stats with an LLM
+# ### 4d · Summarize the stats with an LLM
 # 
 # The digest pattern once more: Claude turns the raw rows into a compact per-team profile (set-piece efficiency, goals per game, etc.) and flags small-sample caveats. It deliberately does **not** output a win probability — that's Step 5's job.
 
@@ -735,8 +774,8 @@ sb_input = json.dumps({
     "source_table": WANTED_TABLE,
     "home_code":    home["short_code"],
     "away_code":    away["short_code"],
-    "home_id":      TEAM_A_ID,
-    "away_id":      TEAM_B_ID,
+    "home_id":      COUNTRY_A_ID,
+    "away_id":      COUNTRY_B_ID,
     "rows":         priors_rows,
 }, default=str)
 
@@ -876,37 +915,81 @@ if prediction:
 
 
 # ## Step 6 · Decide whether to bet (turn the prediction into a trade)
-# 
-# Here the agent acts like a disciplined **bankroll manager** for a $100 play-money account. It compares its own prediction (Step 5) to the market (Step 3) and outputs a concrete decision.
-# 
+#
+# Two sub-steps:
+#
+# | Sub-step | What it does |
+# |----------|--------------|
+# | **6a · Wallet** | Fetch the agent's wallet via `/v1/arena/agents/me` so the strategy knows the real available balance |
+# | **6b · Strategy** | Compare prediction vs market, decide size + limit (or skip) — capped by the wallet from 6a |
+#
 # The key idea is **edge** = (the agent's probability) − (the market's implied probability) for the same outcome:
-# 
+#
 # - **Positive edge** → the market is *underpricing* the pick → consider going **long** (back it).
 # - **Negative edge** → the market is *overpricing* it → consider going **short** (fade it).
 # - **Tiny edge** (noise) → don't trade.
-# 
-# Position size scales with the edge and the agent's confidence (and shrinks when confidence is low). With a small wallet and weak conviction, **not betting is a perfectly good answer.**
+#
+# Position size scales with the edge, the agent's confidence (shrinks when confidence is low), **and is capped by the available balance fetched in 6a**. With a small wallet and weak conviction, not betting is a perfectly good answer.
+
+# ### 6a · Check the agent's wallet
+#
+# Fetch the wallet so we know:
+#
+# - **`available_balance_usdc`** — how much USDC we can actually spend on a new order.
+# - **`locked_balance_usdc`** — USDC already reserved by open orders / unsettled positions.
+# - **`wallet.address`** — the on-chain Polymarket-side wallet. The agent's funder is what tops it up; `polymarket_profile_url` opens the public profile.
+#
+# We pass `available_balance_usdc` into the strategy LLM in 6b so it sizes the trade against the real wallet, not a hardcoded notional.
+
+# In[56]:
+
+
+r = requests.get(
+    f"{ARENA}/api/v1/arena/agents/me",
+    headers=H_ARENA, timeout=10,
+)
+r.raise_for_status()
+agent_info        = r.json()
+wallet            = agent_info.get("wallet") or {}
+balance_available = float(wallet.get("available_balance_usdc") or 0)
+balance_locked    = float(wallet.get("locked_balance_usdc")    or 0)
+
+print(f"HTTP {r.status_code} (OK) -- agent identity + wallet:")
+print(f"  agent_id          : {agent_info.get('agent_id')}")
+print(f"  display_name      : {agent_info.get('display_name')}  ({agent_info.get('lifecycle_phase')})")
+print(f"  wallet address    : {wallet.get('address')}")
+print(f"  balance available : ${balance_available:.4f}  USDC")
+print(f"  balance locked    : ${balance_locked:.4f}  USDC")
+if wallet.get("polymarket_profile_url"):
+    print(f"  polymarket profile: {wallet['polymarket_profile_url']}")
+
+
+# ### 6b · Decide whether to trade
+#
+# The strategy LLM compares the prediction (Step 5) against the market view (Step 3) and the wallet from 6a. It must respect the available balance — sizing past it would just get the order rejected at submission.
 
 # In[57]:
 
 
 STRATEGY_SYS = (
-    "You are a bankroll manager for a $100 demo account. You receive the agent's "
-    "own prediction and the current Polymarket market view, and decide whether "
-    "to trade and on what terms.\n\n"
+    "You are a bankroll manager for an agent's USDC wallet. You receive the "
+    "agent's own prediction, the current Polymarket market view, and the agent's "
+    "available wallet balance — and decide whether to trade and on what terms.\n\n"
 
     "## Input shape\n"
-    "  - prediction        : {outcome, probability, confidence_level, rationale, …}\n"
-    "                        The agent's own view, formed without seeing the market.\n"
-    "  - polymarket_digest : {implied_win_prob, sum_implied_prob, execution_handles,\n"
-    "                        market_handle, data_availability, summary}.\n"
-    "                        The market's view (implied_win_prob keys match team codes).\n\n"
+    "  - prediction              : {outcome, probability, confidence_level, rationale, …}\n"
+    "                              The agent's own view, formed without seeing the market.\n"
+    "  - polymarket_digest       : {implied_win_prob, sum_implied_prob, execution_handles,\n"
+    "                              market_handle, data_availability, summary}.\n"
+    "                              The market's view (implied_win_prob keys match team codes).\n"
+    "  - available_balance_usdc  : float, the agent's spendable USDC right now\n"
+    "                              (from /v1/arena/agents/me). Locked balance is excluded.\n\n"
 
     "## How to decide\n"
     "  1. Edge = prediction.probability − polymarket_digest.implied_win_prob[prediction.outcome]\n"
     "     (in percentage points). Positive edge = market UNDER-prices the pick → long.\n"
     "     Negative edge = market OVER-prices the pick → short.\n"
-    "  2. Size discipline (max $5 per trade, $100 wallet):\n"
+    "  2. Base size (before wallet cap), tuned to a notional $100 bankroll:\n"
     "       |edge| < 5pp                  → don't trade (noise)\n"
     "       |edge| 5-15pp                 → $1-2  (modest position)\n"
     "       |edge| > 15pp                 → $3-5  (high-conviction position)\n"
@@ -915,7 +998,11 @@ STRATEGY_SYS = (
     "       confidence 'high'             → use up to 1.5× (capped at $5)\n"
     "     If the Polymarket digest's data_availability is not 'mids_available', skip — you\n"
     "     can't price an edge without mids.\n"
-    "  3. limit_price is the worst price per share you'll accept. For long, a bit ABOVE the\n"
+    "  3. WALLET CAP: cap the final size at (available_balance_usdc − 0.05) so we leave a\n"
+    "     5¢ slippage buffer. If the resulting size is < $1.00, skip — Polymarket's CLOB\n"
+    "     enforces a $1 minimum order, so smaller orders just get rejected.\n"
+    "     Round size to cents.\n"
+    "  4. limit_price is the worst price per share you'll accept. For long, a bit ABOVE the\n"
     "     current mid for the YES token (e.g. mid 0.665 → limit 0.68). For short, a bit\n"
     "     ABOVE the current mid for the NO token, which is (1 − mid_yes) (e.g. mid_yes 0.665\n"
     "     → NO_mid 0.335 → limit 0.36).\n\n"
@@ -925,20 +1012,22 @@ STRATEGY_SYS = (
     "  'should_trade'   : bool,\n"
     "  'outcome'        : str,                    // echo prediction.outcome — what to trade\n"
     "  'direction'      : 'long' | 'short',       // long = back the outcome; short = fade it\n"
-    "  'size_usdc'      : float,                  // 0 when not trading; ≤5 for this demo\n"
-    "  'limit_price'    : float,                  // 0..1; see rule 3 above\n"
+    "  'size_usdc'      : float,                  // 0 when not trading; ≤ available_balance_usdc − 0.05\n"
+    "  'limit_price'    : float,                  // 0..1; see rule 4 above\n"
     "  'edge_pp'        : float,                  // (agent_prob − market_prob) × 100\n"
     "  'market_handle'  : str,                    // echo polymarket_digest.market_handle for traceability\n"
     "  'rationale'      : str                     // 1-3 sentences self-contained: state the edge,\n"
-    "                                             // the size logic, the limit_price logic.\n"
+    "                                             // the size logic (including wallet cap if applied),\n"
+    "                                             // the limit_price logic.\n"
     "}\n\n"
 
-    "Be conservative: small wallet, weak conviction → skipping is a valid answer."
+    "Be conservative: thin wallet, weak conviction → skipping is a valid answer."
 )
 
 strategy_input = json.dumps({
-    "prediction":        prediction,
-    "polymarket_digest": polymarket_digest,
+    "prediction":             prediction,
+    "polymarket_digest":      polymarket_digest,
+    "available_balance_usdc": balance_available,
 })
 
 # === Anthropic (default) =====================================================
@@ -988,12 +1077,21 @@ elif strategy:
 
 
 # ## Step 7 · Place the bet (open a position)
-# 
-# If Step 6 decided to trade, we build an order and POST it to the arena. If it decided to skip, we do nothing — **predict-only runs are fully supported**, and the reasoning still gets recorded in Step 8.
-# 
+#
+# Two sub-steps:
+#
+# | Sub-step | What it does |
+# |----------|--------------|
+# | **7a · Order**    | Build + POST the order (skipped if Step 6 said don't trade) |
+# | **7b · Exposure** | After the order, GET `/v1/arena/exposure` to confirm the position |
+#
+# An **idempotency key** (a random UUID) is included in the order so that retrying the same request can't accidentally place it twice. **Predict-only runs are fully supported** — if Step 6 said skip, 7a prints a notice and 7b still runs so we can see existing positions.
+
+# ### 7a · Build and submit the order
+#
+# If Step 6 decided to trade, we build an order and POST it to the arena. If it decided to skip, we do nothing — predict-only runs are fully supported, and the reasoning still gets recorded in Step 8.
+#
 # Either way we print the order payload so you can see its shape. (The arena `/orders` endpoint may not be live on staging yet, so the POST can 404 — that's expected here.)
-# 
-# An **idempotency key** (a random UUID) is included so that retrying the same request can't accidentally place the order twice.
 
 # In[40]:
 
@@ -1021,7 +1119,7 @@ if strategy and strategy.get("should_trade"):
         order_payload = {
             "fixture_code":           str(SPORTMONKS_FIXTURE_ID),
             "team_code":              team_code,
-            "usd_size":               strategy["size_usdc"],
+            "usd_size":               f"{strategy['size_usdc']:.2f}",
             "limit_price":            strategy["limit_price"],
             "time_in_force_seconds":  30,
             "idempotency_key":        str(uuid.uuid4()),
@@ -1086,6 +1184,52 @@ if strategy and strategy.get("should_trade"):
 else:
     print("Strategy says DON'T trade, so we skip placing an order.")
     print("Predict-only runs are fully supported -- Step 8 still records everything.")
+
+
+# ### 7b · Verify current exposure
+#
+# After the order (filled, pending, or skipped), GET `/v1/arena/exposure` to see
+# every open position the agent currently holds. Each row reports:
+#
+# - **`fixture_id` + `team_code`** — which outcome of which fixture
+# - **`quantity`** — YES shares held
+# - **`avg_cost_usdc`** — average price paid per share
+# - **`mark_price`** — current mid for that outcome's YES token
+# - **`value_usdc`** — `quantity × mark_price`
+# - **`unrealized_pnl_usdc`** — `value_usdc - (quantity × avg_cost_usdc)`
+#
+# This is the cleanest evidence that the order in 7a actually opened a position —
+# it should now appear as a row keyed by our fixture + the team_code we bought.
+
+# In[41]:
+
+
+r = requests.get(
+    f"{ARENA}/api/v1/arena/exposure",
+    headers=H_ARENA, timeout=10,
+)
+r.raise_for_status()
+exposure  = r.json()
+positions = exposure.get("positions") or []
+
+print(f"HTTP {r.status_code} (OK) -- {len(positions)} open position(s):")
+if not positions:
+    print("  (no open positions)")
+for p in positions:
+    print(f"  fixture {p.get('fixture_id'):>10s}  {p.get('team_code'):>5s}  "
+          f"qty={float(p.get('quantity') or 0):>9.4f}  "
+          f"avg_cost=${float(p.get('avg_cost_usdc') or 0):.4f}  "
+          f"mark=${float(p.get('mark_price')   or 0):.4f}  "
+          f"value=${float(p.get('value_usdc')  or 0):.4f}  "
+          f"upnl=${float(p.get('unrealized_pnl_usdc') or 0):+.4f}")
+
+# Highlight rows belonging to *this* fixture so it's obvious whether 7a moved us.
+_this = [p for p in positions if str(p.get("fixture_id")) == str(SPORTMONKS_FIXTURE_ID)]
+if _this:
+    print(f"\n-> {len(_this)} position(s) on this fixture (id {SPORTMONKS_FIXTURE_ID}).")
+else:
+    print(f"\n-> no positions on fixture {SPORTMONKS_FIXTURE_ID} yet "
+          f"(expected if 7a skipped or hasn't filled).")
 
 
 # # Test to manually place an order
@@ -1372,7 +1516,7 @@ rec_sb_catalog = _new_record(
     upstream_record_id=[rec_trigger["record_id"]],
     tool_meta={"name": "supabase", "endpoint": "/rest/v1/catalog_full"},
     description="Discover available Supabase tables via the public catalog",
-    input_payload={"params": {"select": "table_name,category,row_count,table_description",
+    input_payload={"params": {"select": "table_name,category,row_count,table_description,columns",
                               "order":  "category,table_name"}},
     output_payload={"available_tables": [t["table_name"] for t in catalog],
                     "count": len(catalog)},
@@ -1386,7 +1530,7 @@ rec_sb_priors = _new_record(
     tool_meta={"name": "supabase", "endpoint": f"/rest/v1/{WANTED_TABLE}",
                "schema": "world_cup_arena"},
     description=f"Fetch {WANTED_TABLE} priors for both teams",
-    input_payload={"country_id": f"in.({TEAM_A_ID},{TEAM_B_ID})", "select": "*"},
+    input_payload={"country_id": f"in.({COUNTRY_A_ID},{COUNTRY_B_ID})", "select": "*"},
     output_payload=priors_rows,
     success=True,
 )
