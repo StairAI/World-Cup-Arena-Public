@@ -55,9 +55,10 @@
 # | `SPORTMONKS_PROXY` / `POLYMARKET_*` | Arena **proxy** URLs. You call the arena; it forwards to Sportmonks / Polymarket with its own upstream keys, so you never need theirs. |
 # | `SUPABASE` / `SUPABASE_KEY` | Shared, read-only database access. Already filled in. |
 # | `SPORTMONKS_SEASON_ID` | The World Cup 2026 season id — the only tournament this guide uses. |
-# | `LLM_MODEL`, `LLM_*` | Which Claude model to use and its limits (including "extended thinking," where the model exposes its reasoning). |
+# | `{ANTHROPIC,OPENAI,DEEPSEEK,GEMINI}_MODEL` | The default model for each provider — each one is the cheapest model in its family that actually exposes an internal-reasoning trace. |
+# | `LLM_MAX_TOKENS`, `LLM_THINKING_BUDGET` | Anthropic extended-thinking knobs (consumed by `AnthropicLLM`). `budget_tokens` must be < `max_tokens`. |
 # 
-# `_extract()` is a small helper that pulls the final answer text and the model's thinking out of a Claude response. You'll see it used after every LLM call.
+# The four provider classes (`AnthropicLLM` / `OpenAILLM` / `DeepSeekLLM` / `GeminiLLM`) each expose the same `complete(system_prompt, user_input) -> LLMResult` method, so every LLM call below looks identical regardless of which provider is active.
 
 # In[42]:
 
@@ -80,10 +81,11 @@ ANTHROPIC_KEY    = "FILL IN YOUR ANTHROPIC KEY HERE"   # get one at https://cons
 # This notebook calls Anthropic by default. To use a DIFFERENT provider instead:
 #   1. paste its key below,
 #   2. pip install its SDK (see the optional section in requirements.txt),
-#   3. uncomment its client in the next code cell, and
-#   4. in each LLM cell, comment out the Anthropic block and UNCOMMENT the block
-#      for your provider.
-# The _extract() / _mi() helpers already understand all four response shapes, so
+#   3. in the "Pick a provider" cell at the start of Step 2, comment out the
+#      AnthropicLLM line and UNCOMMENT the line for your provider.
+# The provider-specific reasoning knob + response parsing live inside the four
+# classes (AnthropicLLM / OpenAILLM / DeepSeekLLM / GeminiLLM) defined below —
+# every step just calls llm_client.complete(system_prompt, user_input), so
 # nothing else has to change.
 GEMINI_API_KEY   = "FILL IN YOUR GOOGLE GEMINI KEY HERE"    # Google AI Studio: https://aistudio.google.com/apikey
 OPENAI_API_KEY   = "FILL IN YOUR OPENAI KEY HERE"           # OpenAI:           https://platform.openai.com/api-keys
@@ -100,45 +102,221 @@ SPORTMONKS_SEASON_ID = 26618
 # omit it. The local dump produced by this script also omits it for fidelity
 # with what the agent actually transmits.
 LEDGER_SCHEMA_VERSION = "0.3"
-# The model each provider should use. LLM_MODEL stays the Anthropic model so the
-# default path is unchanged; the others are only used if you switch providers.
-LLM_MODEL             = "claude-haiku-4-5-20251001"   # Anthropic (default)
-GEMINI_MODEL          = "gemini-2.0-flash"            # Google Gemini
-OPENAI_MODEL          = "gpt-4o-mini"                 # OpenAI
-DEEPSEEK_MODEL        = "deepseek-chat"               # DeepSeek (use "deepseek-reasoner" for a thinking trace)
 
-# Anthropic extended-thinking knobs. budget_tokens must be < max_tokens; when
-# enabled, response.content contains both `thinking` and `text` blocks — see
-# scripts/model_reasoning_blocks.ipynb (Pattern A) for the canonical reference.
+# Default model per provider. Each is the smallest model in its family that
+# actually exposes an internal-reasoning trace — picking gpt-4o-mini /
+# gemini-2.0-flash / deepseek-chat would silently return no reasoning content.
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"   # extended thinking via thinking={...}
+OPENAI_MODEL    = "o4-mini"                     # reasoning surface via Responses API
+DEEPSEEK_MODEL  = "deepseek-reasoner"           # exposes message.reasoning_content
+GEMINI_MODEL    = "gemini-2.5-flash"            # thinks if include_thoughts=True
+
+# Anthropic extended-thinking knobs (consumed by AnthropicLLM below).
+# budget_tokens must be < max_tokens; max_tokens caps the TOTAL output
+# (thinking + final text), so leave headroom beyond the budget for the answer.
 LLM_MAX_TOKENS      = 2400
 LLM_THINKING_BUDGET = 1024
-LLM_THINKING        = {"type": "enabled", "budget_tokens": LLM_THINKING_BUDGET}
 
 
-def _extract(resp):
-    """Return (final_text, thinking_text) from ANY of the four providers, so the
-    rest of the notebook stays provider-agnostic:
-      - Anthropic        : resp.content is a list of typed blocks (text/thinking)
-      - OpenAI & DeepSeek: resp.choices[0].message.content (+ reasoning_content,
-                           which DeepSeek's 'deepseek-reasoner' model returns)
-      - Gemini           : resp.text (Gemini hides its thinking by default)"""
-    # Anthropic
-    if hasattr(resp, "content") and isinstance(resp.content, list):
+# === Unified LLM client (4 providers) ========================================
+# Each class wraps ONE provider's SDK + the "enable internal reasoning" knob
+# + the per-provider response-parsing shape. The rest of the notebook then
+# calls llm_client.complete(system_prompt, user_input) and gets back a uniform
+# LLMResult (text, internal_reasoning, token usage). One method covers Step 2,
+# 3, 4d, 5, 6b — switching provider is a one-line change in the cell that
+# picks llm_client.
+#
+# `internal_reasoning` is the schema name from the Reasoning Ledger v0.3
+# ModelInvocation field; LLMResult.to_model_invocation() returns a dict that
+# drops in directly to a Thinking record's `model_invocation` slot.
+from dataclasses import dataclass
+
+
+@dataclass
+class LLMResult:
+    provider:           str
+    model_name:         str
+    text:               str               # the model's final answer
+    internal_reasoning: str               # raw chain-of-thought; "" if none
+    tokens_in:          int | None
+    tokens_out:         int | None
+
+    def to_model_invocation(self) -> dict:
+        """Build a Reasoning Ledger v0.3 ModelInvocation dict. The
+        `internal_reasoning` field is only emitted when there's a trace to
+        record (per schema's "alongside and distinct from final output" rule)."""
+        mi = {
+            "provider":   self.provider,
+            "model_name": self.model_name,
+            "tokens_in":  self.tokens_in,
+            "tokens_out": self.tokens_out,
+        }
+        if self.internal_reasoning:
+            mi["internal_reasoning"] = self.internal_reasoning
+        return mi
+
+
+class AnthropicLLM:
+    """Anthropic Claude with extended thinking.
+    Knob  : thinking={"type":"enabled","budget_tokens":N}
+    Shape : resp.content[] blocks; block.type=='thinking' carries .thinking"""
+    provider = "anthropic"
+
+    def __init__(self, api_key: str,
+                 model:           str = ANTHROPIC_MODEL,
+                 max_tokens:      int = LLM_MAX_TOKENS,
+                 thinking_budget: int = LLM_THINKING_BUDGET):
+        import anthropic
+        self._client      = anthropic.Anthropic(api_key=api_key)
+        self.model_name   = model
+        self.max_tokens   = max_tokens
+        self.thinking_cfg = {"type": "enabled", "budget_tokens": thinking_budget}
+
+    def complete(self, system_prompt: str, user_input: str) -> LLMResult:
+        resp = self._client.messages.create(
+            model       = self.model_name,
+            max_tokens  = self.max_tokens,
+            thinking    = self.thinking_cfg,
+            system      = system_prompt,
+            messages    = [{"role": "user", "content": user_input}],
+        )
         text_parts, thinking_parts = [], []
         for block in resp.content:
-            if block.type == "thinking":
-                thinking_parts.append(block.thinking)
+            if   block.type == "thinking":
+                thinking_parts.append(getattr(block, "thinking", "") or "")
             elif block.type == "text":
-                text_parts.append(block.text)
-        return "".join(text_parts), "\n\n".join(thinking_parts)
-    # OpenAI / DeepSeek (OpenAI-compatible)
-    if hasattr(resp, "choices"):
+                text_parts.append(    getattr(block, "text",     "") or "")
+        return LLMResult(
+            provider           = self.provider,
+            model_name         = self.model_name,
+            text               = "".join(text_parts),
+            internal_reasoning = "\n\n".join(thinking_parts),
+            tokens_in          = resp.usage.input_tokens,
+            tokens_out         = resp.usage.output_tokens,
+        )
+
+
+class OpenAILLM:
+    """OpenAI reasoning models via the *Responses API* (Chat Completions hides
+    the trace even on o-series models — you're billed reasoning_tokens but get
+    nothing back).
+    Knob  : reasoning={"effort": ..., "summary": "auto"}   (summary requires verified org)
+    Shape : resp.output[] items; type=='reasoning' -> .summary[].text"""
+    provider = "openai"
+
+    def __init__(self, api_key: str,
+                 model:  str = OPENAI_MODEL,
+                 effort: str = "medium"):
+        from openai import OpenAI
+        self._client    = OpenAI(api_key=api_key)
+        self.model_name = model
+        self.effort     = effort
+
+    def complete(self, system_prompt: str, user_input: str) -> LLMResult:
+        resp = self._client.responses.create(
+            model     = self.model_name,
+            reasoning = {"effort": self.effort, "summary": "auto"},
+            input     = [{"role": "system", "content": system_prompt},
+                         {"role": "user",   "content": user_input}],
+        )
+        text_parts, thinking_parts = [], []
+        for item in getattr(resp, "output", []) or []:
+            itype = getattr(item, "type", None)
+            if itype == "reasoning":
+                for s in getattr(item, "summary", []) or []:
+                    t = getattr(s, "text", None)
+                    if t:
+                        thinking_parts.append(t)
+            elif itype == "message":
+                for c in getattr(item, "content", []) or []:
+                    t = getattr(c, "text", None)
+                    if t:
+                        text_parts.append(t)
+        usage = getattr(resp, "usage", None)
+        return LLMResult(
+            provider           = self.provider,
+            model_name         = self.model_name,
+            text               = "\n".join(text_parts),
+            internal_reasoning = "\n".join(thinking_parts),
+            tokens_in          = getattr(usage, "input_tokens",  None),
+            tokens_out         = getattr(usage, "output_tokens", None),
+        )
+
+
+class DeepSeekLLM:
+    """DeepSeek on the OpenAI-compatible Chat Completions endpoint.
+    Knob  : model='deepseek-reasoner' (no extra param; the model controls reasoning)
+    Shape : resp.choices[0].message.reasoning_content"""
+    provider = "deepseek"
+
+    def __init__(self, api_key: str,
+                 model: str = DEEPSEEK_MODEL):
+        from openai import OpenAI
+        self._client    = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+        self.model_name = model
+
+    def complete(self, system_prompt: str, user_input: str) -> LLMResult:
+        resp = self._client.chat.completions.create(
+            model    = self.model_name,
+            messages = [{"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": user_input}],
+        )
         msg = resp.choices[0].message
-        return (msg.content or ""), (getattr(msg, "reasoning_content", "") or "")
-    # Gemini
-    if hasattr(resp, "text"):
-        return (resp.text or ""), ""
-    raise TypeError(f"Unrecognized LLM response type: {type(resp)!r}")
+        return LLMResult(
+            provider           = self.provider,
+            model_name         = self.model_name,
+            text               = (getattr(msg, "content",           "") or ""),
+            internal_reasoning = (getattr(msg, "reasoning_content", "") or ""),
+            tokens_in          = resp.usage.prompt_tokens,
+            tokens_out         = resp.usage.completion_tokens,
+        )
+
+
+class GeminiLLM:
+    """Google Gemini 2.5+ with thinking opt-in.
+    Knob  : thinking_config(include_thoughts=True)   (2.5 thinks internally but hides by default)
+    Shape : resp.candidates[].content.parts[]; part.thought==True -> trace"""
+    provider = "gemini"
+
+    def __init__(self, api_key: str,
+                 model: str = GEMINI_MODEL):
+        from google import genai
+        from google.genai import types as gtypes
+        self._client    = genai.Client(api_key=api_key)
+        self._types     = gtypes
+        self.model_name = model
+
+    def complete(self, system_prompt: str, user_input: str) -> LLMResult:
+        resp = self._client.models.generate_content(
+            model    = self.model_name,
+            contents = user_input,
+            config   = self._types.GenerateContentConfig(
+                system_instruction = system_prompt,
+                thinking_config    = self._types.ThinkingConfig(include_thoughts=True),
+            ),
+        )
+        text_parts, thinking_parts = [], []
+        for cand in getattr(resp, "candidates", []) or []:
+            content = getattr(cand, "content", None)
+            if not content:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                t = getattr(part, "text", None)
+                if not t:
+                    continue
+                if getattr(part, "thought", False):
+                    thinking_parts.append(t)
+                else:
+                    text_parts.append(t)
+        um = getattr(resp, "usage_metadata", None)
+        return LLMResult(
+            provider           = self.provider,
+            model_name         = self.model_name,
+            text               = "\n".join(text_parts),
+            internal_reasoning = "\n".join(thinking_parts),
+            tokens_in          = getattr(um, "prompt_token_count",     None) if um else None,
+            tokens_out         = getattr(um, "candidates_token_count", None) if um else None,
+        )
 
 
 # --- Sanity check: catch a placeholder key NOW, not 6 cells from now. ---
@@ -149,7 +327,7 @@ if _missing:
 else:
     print("Both API keys are set.")
 print(f"Arena  : {ARENA}")
-print(f"Model  : {LLM_MODEL}")
+print(f"Models : {ANTHROPIC_MODEL} | {OPENAI_MODEL} | {DEEPSEEK_MODEL} | {GEMINI_MODEL}")
 print(f"Season : World Cup 2026 (id {SPORTMONKS_SEASON_ID})")
 print("Setup complete -- run the cells below in order.")
 
@@ -263,44 +441,44 @@ print(f"  - expected-goals (xG)          : {len(fixture.get('xgfixture') or [])}
 # 
 # Why bother? Later steps (the prediction in Step 5) only need the distilled signals, not hundreds of raw rows. Digesting now keeps every downstream prompt small, cheap, and consistent. This "fetch → digest" pattern repeats in Steps 3 and 4.
 # 
-# Note: we enable **extended thinking**, so the response has both a `thinking` trace and the final `text`. `_extract()` separates them, and a regex pulls the JSON object out of the text.
+# Note: every provider's class wrapper has its "expose internal reasoning" knob turned on by default — so `llm_digest.text` carries the final answer and `llm_digest.internal_reasoning` carries the chain-of-thought trace (empty if the chosen model can't expose one). A regex pulls the JSON object out of `.text`.
 
 # In[46]:
 
 
-import anthropic
-client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-
-# To use a different provider, uncomment its client here (after pip-installing the
-# SDK), then uncomment that provider's call block in each LLM cell below.
-# from google import genai                                    # pip install google-genai
-# gemini_client   = genai.Client(api_key=GEMINI_API_KEY)
-# from openai import OpenAI                                   # pip install openai
-# openai_client   = OpenAI(api_key=OPENAI_API_KEY)
-# deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+# Pick ONE provider. The classes from the Setup cell wrap the SDK + the
+# "enable internal reasoning" knob + the per-provider response-parsing shape,
+# so the rest of the notebook stays provider-agnostic — every step just calls
+# `llm_client.complete(system_prompt, user_input)` and reads `.text` +
+# `.internal_reasoning` off the LLMResult. Comment out the three you don't use.
+llm_client = AnthropicLLM(api_key=ANTHROPIC_KEY)
+# llm_client = OpenAILLM  (api_key=OPENAI_API_KEY)     # needs verified org for reasoning summaries
+# llm_client = DeepSeekLLM(api_key=DEEPSEEK_API_KEY)   # uses deepseek-reasoner by default
+# llm_client = GeminiLLM  (api_key=GEMINI_API_KEY)     # uses gemini-2.5-flash by default
+print(f"LLM client: {llm_client.provider} ({llm_client.model_name})")
 
 DIGEST_SYS = (
-    "You are a soccer analyst. You receive a raw Sportmonks pre-match payload for "
-    "one fixture and must distil it into a self-contained JSON digest that a "
-    "downstream LLM (with no other context about Sportmonks) will read.\n\n"
+    "You are a soccer analyst. You receive ONE Sportmonks 1X2 winner prediction "
+    "row + ONE example bookmaker's complete 1X2 quote (three rows, one per "
+    "outcome) + xG entries for one fixture, and must distil them into a "
+    "self-contained JSON digest that a downstream LLM (with no other context "
+    "about Sportmonks) will read.\n\n"
 
     "## Input shape\n"
     "  - fixture       : match name (e.g. 'Mexico vs South Africa')\n"
     "  - home_code     : home team short code (use as a JSON key for the home outcome)\n"
     "  - away_code     : away team short code (use as a JSON key for the away outcome)\n"
-    "  - predictions[] : Sportmonks ML model rows. Each row has `type_id` (numeric — "
-    "                    the Full-Time-Result / 1X2 winner type carries win/draw/loss "
-    "                    probabilities) and a `predictions` object with the numeric "
-    "                    probability values. May be empty if Sportmonks has no model "
-    "                    output for this fixture.\n"
-    "  - odds[]        : bookmaker odds rows. Each row is ONE bookmaker's price for "
-    "                    ONE outcome of ONE market. Key fields: `bookmaker_id`, "
-    "                    `market_id` (1 = Full-Time-Result / 1X2 winner — IGNORE other "
-    "                    markets), `label` ('1' home, 'X' draw, '2' away), `value` "
-    "                    (decimal odds), `probability` (implied probability as a "
-    "                    percentage 0-100). For the consensus, average `probability` "
-    "                    across all bookmakers for market_id == 1 only, then divide by "
-    "                    100 to express as 0..1. May be empty.\n"
+    "  - prediction    : ONE Sportmonks 1X2 winner prediction row (type_id 237), or null. "
+    "                    Has a `predictions` object keyed by `home` / `draw` / `away` with "
+    "                    percentage probabilities (0-100). Divide by 100 to express in 0..1.\n"
+    "  - odds          : ONE example bookmaker's COMPLETE 1X2 winner quote — a list of "
+    "                    three rows (or empty list). Each row: `bookmaker_id`, "
+    "                    `market_id` (always 1 here = 1X2 winner), `label` "
+    "                    ('Home' / 'Draw' / 'Away'), `value` (decimal odds), "
+    "                    `probability` (implied probability as a percentage 0-100). "
+    "                    Divide `probability` by 100 to express in 0..1. NOTE: a real "
+    "                    agent would aggregate across many bookmakers; this single "
+    "                    bookmaker is illustrative only.\n"
     "  - xGFixture[]   : expected-goals entries per team. Each row has "
     "                    `participant_id` (team id matching home/away participant) and "
     "                    `value` (xG number). May be empty.\n\n"
@@ -311,74 +489,73 @@ DIGEST_SYS = (
     "  'home_team'                     : str,                                                          // home_code\n"
     "  'away_team'                     : str,                                                          // away_code\n"
     "  'sportmonks_ml_win_prob'        : {home_code: float, 'draw': float, away_code: float} | null,   // probabilities in 0..1; sum ≈ 1\n"
-    "  'bookmaker_consensus_win_prob'  : {home_code: float, 'draw': float, away_code: float} | null,   // probabilities in 0..1\n"
-    "  'bookmaker_count'               : int | null,                                                   // bookmakers averaged into consensus\n"
+    "  'bookmaker_example_win_prob'    : {home_code: float, 'draw': float, away_code: float} | null,   // probabilities in 0..1; from ONE bookmaker only\n"
     "  'expected_goals'                : {home_code: float, away_code: float} | null,                  // xG per side\n"
     "  'data_availability': {                                                                          // honest reporting so downstream knows what's missing\n"
     "    'sportmonks_ml'        : 'available' | 'missing',\n"
-    "    'bookmaker_consensus'  : 'available' | 'missing',\n"
+    "    'bookmaker_example'    : 'available' | 'missing',\n"
     "    'expected_goals'       : 'available' | 'missing'\n"
     "  },\n"
-    "  'summary': str   // 1-3 sentences. MUST be readable in isolation by an LLM that has no other Sportmonks context. Name the available signals and what they imply; if everything is missing, say so plainly. Mention the home/away team codes by name.\n"
+    "  'summary': str   // 1-3 sentences. MUST be readable in isolation by an LLM that has no other Sportmonks context. Name the available signals and what they imply. Flag explicitly that bookmaker_example is from a single bookmaker, not a consensus.\n"
     "}\n\n"
 
     "Use null (not 0) when source data is missing. Do NOT fabricate values."
 )
 
-# The user message is identical across providers, so build it once.
-digest_input = json.dumps({
-    "fixture":     fixture["name"],
-    "home_code":   home["short_code"],
-    "away_code":   away["short_code"],
-    "predictions": fixture.get("predictions"),
-    "odds":        sorted(
-        [o for o in (fixture.get("odds") or []) if o.get("market_id") == 1],
-        key=lambda o: o.get("latest_bookmaker_update") or "",
-    )[-1:],  # latest single 1X2 odds row (full odds list overflows the context window)
-    "xGFixture":   fixture.get("xgfixture"),    # field is lowercase despite include name
-})
+# Sportmonks returns dozens of prediction rows + dozens of bookmakers' odds —
+# way more than the LLM needs (and far more than fits in a context window).
+# Pre-filter to:
+#   - top_prediction : the type_id=237 (Full-Time-Result / 1X2 winner) row
+#   - top_odds       : ONE bookmaker's COMPLETE 1X2 quote (3 rows: Home/Draw/Away).
+#                      A single odds row only carries ONE outcome's price; we need
+#                      all three to form a probability picture. Picking the first
+#                      qualifying bookmaker keeps the input small and forensically
+#                      reproducible (no averaging, no random sampling).
+# These same `top_*` slices are also what the ledger logs in Step 8, so the
+# Thinking record's input_payload matches what the LLM actually saw.
+SPORTMONKS_1X2_PREDICTION_TYPE_ID = 237
+SPORTMONKS_1X2_MARKET_ID          = 1
+SPORTMONKS_1X2_LABELS             = {"Home", "Draw", "Away"}
 
-# === Anthropic (default) =====================================================
-llm_digest = client.messages.create(
-    model=LLM_MODEL,
-    max_tokens=LLM_MAX_TOKENS,
-    thinking=LLM_THINKING,
-    system=DIGEST_SYS,
-    messages=[{"role": "user", "content": digest_input}],
+_all_predictions = fixture.get("predictions") or []
+_all_odds        = fixture.get("odds")        or []
+top_prediction   = next(
+    (p for p in _all_predictions
+     if p.get("type_id") == SPORTMONKS_1X2_PREDICTION_TYPE_ID),
+    None,
+)
+# Group 1X2 odds by bookmaker, pick first one with a full Home/Draw/Away quote.
+_1x2_by_bm: dict = {}
+for o in _all_odds:
+    if o.get("market_id") != SPORTMONKS_1X2_MARKET_ID:
+        continue
+    _1x2_by_bm.setdefault(o.get("bookmaker_id"), {})[o.get("label")] = o
+top_odds = next(
+    (list(rows.values())
+     for rows in _1x2_by_bm.values()
+     if SPORTMONKS_1X2_LABELS.issubset(rows)),
+    [],
 )
 
-# === Gemini -- uncomment to use (and comment out the Anthropic block above) ===
-# llm_digest = gemini_client.models.generate_content(
-#     model=GEMINI_MODEL,
-#     contents=digest_input,
-#     config={"system_instruction": DIGEST_SYS, "max_output_tokens": LLM_MAX_TOKENS},
-# )
+# The user message is identical across providers, so build it once.
+digest_input = json.dumps({
+    "fixture":    fixture["name"],
+    "home_code":  home["short_code"],
+    "away_code":  away["short_code"],
+    "prediction": top_prediction,
+    "odds":       top_odds,
+    "xGFixture":  fixture.get("xgfixture"),    # field is lowercase despite include name
+})
 
-# === OpenAI -- uncomment to use ==============================================
-# llm_digest = openai_client.chat.completions.create(
-#     model=OPENAI_MODEL,
-#     max_tokens=LLM_MAX_TOKENS,
-#     messages=[{"role": "system", "content": DIGEST_SYS},
-#               {"role": "user",   "content": digest_input}],
-# )
+llm_digest = llm_client.complete(DIGEST_SYS, digest_input)
 
-# === DeepSeek -- uncomment to use ============================================
-# llm_digest = deepseek_client.chat.completions.create(
-#     model=DEEPSEEK_MODEL,
-#     max_tokens=LLM_MAX_TOKENS,
-#     messages=[{"role": "system", "content": DIGEST_SYS},
-#               {"role": "user",   "content": digest_input}],
-# )
-
-raw, thinking_digest = _extract(llm_digest)
-
-# Claude returns the digest as text; pull the {...} object out of it
+# The model returns the digest as text; pull the {...} object out of it
 # (re.DOTALL lets the regex span newlines; also strips any prose/code fences).
 import re
-match = re.search(r"\{.*\}", raw, re.DOTALL)
+match = re.search(r"\{.*\}", llm_digest.text, re.DOTALL)
 sportmonks_digest = json.loads(match.group(0)) if match else None
 
-print(f"Claude reasoned for {len(thinking_digest)} chars before answering.")
+print(f"The model reasoned for {len(llm_digest.internal_reasoning)} chars before answering.")
 print("Clean digest the rest of the notebook will use:\n")
 print(json.dumps(sportmonks_digest, indent=2))
 
@@ -555,43 +732,11 @@ if moneyline is None:
     }
 else:
     pm_input = json.dumps(moneyline)
-
-    # === Anthropic (default) =================================================
-    llm_pm = client.messages.create(
-        model=LLM_MODEL,
-        max_tokens=LLM_MAX_TOKENS,
-        thinking=LLM_THINKING,
-        system=POLYMARKET_DIGEST_SYS,
-        messages=[{"role": "user", "content": pm_input}],
-    )
-
-    # === Gemini -- uncomment to use (comment out the Anthropic block above) ==
-    # llm_pm = gemini_client.models.generate_content(
-    #     model=GEMINI_MODEL,
-    #     contents=pm_input,
-    #     config={"system_instruction": POLYMARKET_DIGEST_SYS, "max_output_tokens": LLM_MAX_TOKENS},
-    # )
-
-    # === OpenAI -- uncomment to use =========================================
-    # llm_pm = openai_client.chat.completions.create(
-    #     model=OPENAI_MODEL,
-    #     max_tokens=LLM_MAX_TOKENS,
-    #     messages=[{"role": "system", "content": POLYMARKET_DIGEST_SYS},
-    #               {"role": "user",   "content": pm_input}],
-    # )
-
-    # === DeepSeek -- uncomment to use =======================================
-    # llm_pm = deepseek_client.chat.completions.create(
-    #     model=DEEPSEEK_MODEL,
-    #     max_tokens=LLM_MAX_TOKENS,
-    #     messages=[{"role": "system", "content": POLYMARKET_DIGEST_SYS},
-    #               {"role": "user",   "content": pm_input}],
-    # )
-
-    raw_pm, thinking_pm = _extract(llm_pm)
-    m = re.search(r"\{.*\}", raw_pm, re.DOTALL)
+    llm_pm   = llm_client.complete(POLYMARKET_DIGEST_SYS, pm_input)
+    m = re.search(r"\{.*\}", llm_pm.text, re.DOTALL)
     polymarket_digest = json.loads(m.group(0)) if m else None
-    print(f"Claude digested the market ({len(thinking_pm)} chars of thinking).")
+    print(f"The model digested the market "
+          f"({len(llm_pm.internal_reasoning)} chars of thinking).")
 
 print("\nMarket digest (implied probabilities + execution handles):\n")
 print(json.dumps(polymarket_digest, indent=2))
@@ -776,43 +921,12 @@ sb_input = json.dumps({
     "rows":         priors_rows,
 }, default=str)
 
-# === Anthropic (default) =====================================================
-llm_sb = client.messages.create(
-    model=LLM_MODEL,
-    max_tokens=LLM_MAX_TOKENS,
-    thinking=LLM_THINKING,
-    system=SUPABASE_DIGEST_SYS,
-    messages=[{"role": "user", "content": sb_input}],
-)
-
-# === Gemini -- uncomment to use (and comment out the Anthropic block above) ===
-# llm_sb = gemini_client.models.generate_content(
-#     model=GEMINI_MODEL,
-#     contents=sb_input,
-#     config={"system_instruction": SUPABASE_DIGEST_SYS, "max_output_tokens": LLM_MAX_TOKENS},
-# )
-
-# === OpenAI -- uncomment to use ==============================================
-# llm_sb = openai_client.chat.completions.create(
-#     model=OPENAI_MODEL,
-#     max_tokens=LLM_MAX_TOKENS,
-#     messages=[{"role": "system", "content": SUPABASE_DIGEST_SYS},
-#               {"role": "user",   "content": sb_input}],
-# )
-
-# === DeepSeek -- uncomment to use ============================================
-# llm_sb = deepseek_client.chat.completions.create(
-#     model=DEEPSEEK_MODEL,
-#     max_tokens=LLM_MAX_TOKENS,
-#     messages=[{"role": "system", "content": SUPABASE_DIGEST_SYS},
-#               {"role": "user",   "content": sb_input}],
-# )
-
-raw_sb, thinking_sb = _extract(llm_sb)
-m = re.search(r"\{.*\}", raw_sb, re.DOTALL)
+llm_sb = llm_client.complete(SUPABASE_DIGEST_SYS, sb_input)
+m = re.search(r"\{.*\}", llm_sb.text, re.DOTALL)
 supabase_digest = json.loads(m.group(0)) if m else None
 
-print(f"Claude summarized the stats ({len(thinking_sb)} chars of thinking).")
+print(f"The model summarized the stats "
+      f"({len(llm_sb.internal_reasoning)} chars of thinking).")
 print("Per-team stats digest for Step 5:\n")
 print(json.dumps(supabase_digest, indent=2))
 
@@ -868,43 +982,12 @@ predict_input = json.dumps({
     "supabase_digest":   supabase_digest,
 })
 
-# === Anthropic (default) =====================================================
-llm_predict = client.messages.create(
-    model=LLM_MODEL,
-    max_tokens=LLM_MAX_TOKENS,
-    thinking=LLM_THINKING,
-    system=PREDICT_SYS,
-    messages=[{"role": "user", "content": predict_input}],
-)
-
-# === Gemini -- uncomment to use (and comment out the Anthropic block above) ===
-# llm_predict = gemini_client.models.generate_content(
-#     model=GEMINI_MODEL,
-#     contents=predict_input,
-#     config={"system_instruction": PREDICT_SYS, "max_output_tokens": LLM_MAX_TOKENS},
-# )
-
-# === OpenAI -- uncomment to use ==============================================
-# llm_predict = openai_client.chat.completions.create(
-#     model=OPENAI_MODEL,
-#     max_tokens=LLM_MAX_TOKENS,
-#     messages=[{"role": "system", "content": PREDICT_SYS},
-#               {"role": "user",   "content": predict_input}],
-# )
-
-# === DeepSeek -- uncomment to use ============================================
-# llm_predict = deepseek_client.chat.completions.create(
-#     model=DEEPSEEK_MODEL,
-#     max_tokens=LLM_MAX_TOKENS,
-#     messages=[{"role": "system", "content": PREDICT_SYS},
-#               {"role": "user",   "content": predict_input}],
-# )
-
-raw_pred, thinking_pred = _extract(llm_predict)
-m = re.search(r"\{.*\}", raw_pred, re.DOTALL)
+llm_predict = llm_client.complete(PREDICT_SYS, predict_input)
+m = re.search(r"\{.*\}", llm_predict.text, re.DOTALL)
 prediction = json.loads(m.group(0)) if m else None
 
-print(f"The agent formed its own prediction ({len(thinking_pred)} chars of thinking):\n")
+print(f"The agent formed its own prediction "
+      f"({len(llm_predict.internal_reasoning)} chars of thinking):\n")
 print(json.dumps(prediction, indent=2))
 if prediction:
     print(f"\n-> In plain words: most likely '{prediction['outcome']}' at "
@@ -1027,43 +1110,12 @@ strategy_input = json.dumps({
     "available_balance_usdc": balance_available,
 })
 
-# === Anthropic (default) =====================================================
-llm_strategy = client.messages.create(
-    model=LLM_MODEL,
-    max_tokens=LLM_MAX_TOKENS,
-    thinking=LLM_THINKING,
-    system=STRATEGY_SYS,
-    messages=[{"role": "user", "content": strategy_input}],
-)
-
-# === Gemini -- uncomment to use (and comment out the Anthropic block above) ===
-# llm_strategy = gemini_client.models.generate_content(
-#     model=GEMINI_MODEL,
-#     contents=strategy_input,
-#     config={"system_instruction": STRATEGY_SYS, "max_output_tokens": LLM_MAX_TOKENS},
-# )
-
-# === OpenAI -- uncomment to use ==============================================
-# llm_strategy = openai_client.chat.completions.create(
-#     model=OPENAI_MODEL,
-#     max_tokens=LLM_MAX_TOKENS,
-#     messages=[{"role": "system", "content": STRATEGY_SYS},
-#               {"role": "user",   "content": strategy_input}],
-# )
-
-# === DeepSeek -- uncomment to use ============================================
-# llm_strategy = deepseek_client.chat.completions.create(
-#     model=DEEPSEEK_MODEL,
-#     max_tokens=LLM_MAX_TOKENS,
-#     messages=[{"role": "system", "content": STRATEGY_SYS},
-#               {"role": "user",   "content": strategy_input}],
-# )
-
-raw_strat, thinking_strat = _extract(llm_strategy)
-m = re.search(r"\{.*\}", raw_strat, re.DOTALL)
+llm_strategy = llm_client.complete(STRATEGY_SYS, strategy_input)
+m = re.search(r"\{.*\}", llm_strategy.text, re.DOTALL)
 strategy = json.loads(m.group(0)) if m else None
 
-print(f"The agent decided on a strategy ({len(thinking_strat)} chars of thinking):\n")
+print(f"The agent decided on a strategy "
+      f"({len(llm_strategy.internal_reasoning)} chars of thinking):\n")
 print(json.dumps(strategy, indent=2))
 if strategy and strategy.get("should_trade"):
     print(f"\n-> In plain words: {strategy['direction'].upper()} ${strategy['size_usdc']:.2f} on "
@@ -1344,36 +1396,17 @@ def _new_record(behavior, **fields):
     rec.update({k: v for k, v in fields.items() if v is not None})
     return rec
 
-def _mi(resp):
-    """Build a ModelInvocation dict from ANY provider's response (Anthropic /
-    OpenAI / DeepSeek / Gemini). Captures the `internal_reasoning` trace when the
-    provider exposes one -- see schema v0.3 ModelInvocation."""
-    _, thinking = _extract(resp)
-    if hasattr(resp, "usage") and hasattr(resp.usage, "input_tokens"):          # Anthropic
-        provider, model = "anthropic", LLM_MODEL
-        tokens_in, tokens_out = resp.usage.input_tokens, resp.usage.output_tokens
-    elif hasattr(resp, "usage") and hasattr(resp.usage, "prompt_tokens"):       # OpenAI / DeepSeek
-        model = getattr(resp, "model", "") or ""
-        provider = "deepseek" if "deepseek" in model else "openai"
-        tokens_in, tokens_out = resp.usage.prompt_tokens, resp.usage.completion_tokens
-    elif hasattr(resp, "usage_metadata"):                                       # Gemini
-        provider, model = "gemini", GEMINI_MODEL
-        um = resp.usage_metadata
-        tokens_in  = getattr(um, "prompt_token_count", None)
-        tokens_out = getattr(um, "candidates_token_count", None)
-    else:
-        provider, model, tokens_in, tokens_out = "unknown", "", None, None
-    mi = {"provider": provider, "model_name": model,
-          "tokens_in": tokens_in, "tokens_out": tokens_out}
-    if thinking:
-        mi["internal_reasoning"] = thinking
-    return mi
+# `_mi(resp)` was removed in the refactor — provider routing + extraction now
+# lives on LLMResult, so use `llm_X.to_model_invocation()` instead. That keeps
+# the schema's `internal_reasoning` field populated correctly for every
+# provider (see Setup cell, LLMResult).
 
-def _trunc(obj, limit=30000):
-    """JSON-stringify + truncate to keep individual fields under SDK size limits
-    (Thinking.output_payload ≤ 32 KB; per-record JSON ≤ 64 KB)."""
-    s = obj if isinstance(obj, str) else json.dumps(obj, default=str)
-    return s if len(s) <= limit else s[:limit] + f"…[truncated, was {len(s)} chars]"
+def _jstr(obj):
+    """JSON-stringify for ledger fields the schema types as `string`
+    (Thinking.inputs[].input_payload, Thinking.output_payload). No truncation —
+    SIZE_LIMITS in SCHEMA.md are advisory; the server will tell us if a record
+    exceeds them and we'd rather lose the record than silently lose content."""
+    return obj if isinstance(obj, str) else json.dumps(obj, default=str)
 
 
 # (1) Observing — synthetic cron trigger that woke the agent.
@@ -1423,24 +1456,26 @@ rec_sm_fixture = _new_record(
     success=True,
 )
 
-# (4) Thinking — Sportmonks digest
+# (4) Thinking — Sportmonks digest. inputs[].input_payload mirrors what the LLM
+# actually saw in Step 2 (top_prediction + top_odds), not the raw upstream lists,
+# so the ledger trace is forensically reproducible.
 rec_th_sportmonks = _new_record(
     "Thinking",
     upstream_record_id=[rec_sm_fixture["record_id"]],
-    model_invocation=_mi(llm_digest),
-    prompt=_trunc(DIGEST_SYS, limit=16000),
+    model_invocation=llm_digest.to_model_invocation(),
+    prompt=DIGEST_SYS,
     inputs=[{
         "input_record_id": rec_sm_fixture["record_id"],
-        "input_payload":   _trunc({
-            "fixture":     fixture["name"],
-            "home_code":   home["short_code"],
-            "away_code":   away["short_code"],
-            "predictions": fixture.get("predictions"),
-            "odds":        fixture.get("odds"),
-            "xGFixture":   fixture.get("xgfixture"),
+        "input_payload":   _jstr({
+            "fixture":    fixture["name"],
+            "home_code":  home["short_code"],
+            "away_code":  away["short_code"],
+            "prediction": top_prediction,
+            "odds":       top_odds,
+            "xGFixture":  fixture.get("xgfixture"),
         }),
     }],
-    output_payload=_trunc(sportmonks_digest),
+    output_payload=_jstr(sportmonks_digest),
 )
 
 # (5a) ToolCalling — arena: look up the polymarket event slug for the fixture.
@@ -1498,13 +1533,13 @@ rec_th_polymarket = _new_record(
     upstream_record_id=[rec_pm_slug["record_id"],
                         rec_pm_event["record_id"],
                         rec_pm_mids["record_id"]],
-    model_invocation=_mi(llm_pm),
-    prompt=_trunc(POLYMARKET_DIGEST_SYS, limit=16000),
+    model_invocation=llm_pm.to_model_invocation(),
+    prompt=POLYMARKET_DIGEST_SYS,
     inputs=[{
         "input_record_id": rec_pm_mids["record_id"],
-        "input_payload":   _trunc(moneyline),
+        "input_payload":   _jstr(moneyline),
     }],
-    output_payload=_trunc(polymarket_digest),
+    output_payload=_jstr(polymarket_digest),
 )
 
 # (7) ToolCalling — Supabase catalog discovery
@@ -1536,11 +1571,11 @@ rec_sb_priors = _new_record(
 rec_th_supabase = _new_record(
     "Thinking",
     upstream_record_id=[rec_sb_priors["record_id"]],
-    model_invocation=_mi(llm_sb),
-    prompt=_trunc(SUPABASE_DIGEST_SYS, limit=16000),
+    model_invocation=llm_sb.to_model_invocation(),
+    prompt=SUPABASE_DIGEST_SYS,
     inputs=[{
         "input_record_id": rec_sb_priors["record_id"],
-        "input_payload":   _trunc({
+        "input_payload":   _jstr({
             "fixture":      fixture["name"],
             "source_table": WANTED_TABLE,
             "home_code":    home["short_code"],
@@ -1548,7 +1583,7 @@ rec_th_supabase = _new_record(
             "rows":         priors_rows,
         }),
     }],
-    output_payload=_trunc(supabase_digest),
+    output_payload=_jstr(supabase_digest),
 )
 
 # (10) Thinking — Predict (priors only, blind to market).
@@ -1557,15 +1592,15 @@ rec_th_supabase = _new_record(
 rec_th_predict = _new_record(
     "Thinking",
     upstream_record_id=[rec_th_sportmonks["record_id"], rec_th_supabase["record_id"]],
-    model_invocation=_mi(llm_predict),
-    prompt=_trunc(PREDICT_SYS, limit=16000),
+    model_invocation=llm_predict.to_model_invocation(),
+    prompt=PREDICT_SYS,
     inputs=[
         {"input_record_id": rec_th_sportmonks["record_id"],
-         "input_payload":   _trunc(sportmonks_digest)},
+         "input_payload":   _jstr(sportmonks_digest)},
         {"input_record_id": rec_th_supabase["record_id"],
-         "input_payload":   _trunc(supabase_digest)},
+         "input_payload":   _jstr(supabase_digest)},
     ],
-    output_payload=_trunc(prediction),
+    output_payload=_jstr(prediction),
 )
 
 # (11) Acting — Prediction (validated + scored by the arena).
@@ -1581,7 +1616,7 @@ rec_act_predict = _new_record(
     target_system=   "arena",
     action_summary=  f"Predict {prediction['outcome']} @ p={_pred_prob:.2f} for fixture {SPORTMONKS_FIXTURE_ID}",
     parameters=      {
-        "fixture_code": str(SPORTMONKS_FIXTURE_ID),
+        "fixture_id": str(SPORTMONKS_FIXTURE_ID),
         "outcome":      prediction["outcome"],
         "probability":  _pred_prob,
     },
@@ -1593,15 +1628,15 @@ rec_act_predict = _new_record(
 rec_th_strategy = _new_record(
     "Thinking",
     upstream_record_id=[rec_th_predict["record_id"], rec_th_polymarket["record_id"]],
-    model_invocation=_mi(llm_strategy),
-    prompt=_trunc(STRATEGY_SYS, limit=16000),
+    model_invocation=llm_strategy.to_model_invocation(),
+    prompt=STRATEGY_SYS,
     inputs=[
         {"input_record_id": rec_th_predict["record_id"],
-         "input_payload":   _trunc(prediction)},
+         "input_payload":   _jstr(prediction)},
         {"input_record_id": rec_th_polymarket["record_id"],
-         "input_payload":   _trunc(polymarket_digest)},
+         "input_payload":   _jstr(polymarket_digest)},
     ],
-    output_payload=_trunc(strategy),
+    output_payload=_jstr(strategy),
 )
 
 records = [
@@ -1643,6 +1678,16 @@ for rec in records:
              or rec.get("trigger_description")
              or rec.get("prompt", "")[:50])
     print(f"  {rec['behavior']:12s} {rec['record_id'][:8]}...  {label}")
+
+# Persist the batch payload locally before POSTing, so it can be inspected,
+# diffed against the server's per-record response, or replayed verbatim if
+# the POST fails or returns ambiguous errors.
+import pathlib
+PAYLOAD_PATH = pathlib.Path("output/ledger_batch_payload.json")
+PAYLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+PAYLOAD_PATH.write_text(json.dumps({"records": records}, indent=2, default=str))
+print(f"\nPayload saved to {PAYLOAD_PATH} "
+      f"({len(records)} records, {PAYLOAD_PATH.stat().st_size} bytes)")
 
 # Submit the trace as a single batch. Per the new ledger contract:
 #   - No session-create endpoint; session_id is purely a client-side string.
