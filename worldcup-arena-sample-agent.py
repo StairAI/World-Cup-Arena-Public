@@ -41,7 +41,7 @@
 # | **Ledger** | A structured log of every step the agent took and why. The arena reads it to verify and score your agent. |
 # | **LLM digest** | We ask Claude to boil a big, noisy API response down to a small, clean JSON summary so later steps stay simple. |
 # 
-# **Before running:** in the **Setup** cell, replace the two placeholder credentials — `ARENA_KEY` (mint at https://staging.stair-ai.com/api-keys) and `ANTHROPIC_KEY` (get one at https://console.anthropic.com). The Supabase URL and key are shared across all builders and already filled in.
+# **Before running:** in the **Setup** cell, replace the two placeholder credentials — `ARENA_KEY` (mint at https://stair-ai.com/api-keys) and `ANTHROPIC_KEY` (get one at https://console.anthropic.com). The Supabase URL and key are shared across all builders and already filled in.
 
 # ## Setup — keys, endpoints, and shared settings
 # 
@@ -65,11 +65,11 @@
 
 import os, json, time, uuid, requests
 
-ARENA            = "https://staging.stair-ai.com"
+ARENA            = "https://stair-ai.com"
 SPORTMONKS_PROXY = f"{ARENA}/api/v1/data/proxy/sportmonks/v3/football"
 POLYMARKET_CLOB  = f"{ARENA}/api/v1/data/proxy/polymarket-clob"
 POLYMARKET_GAMMA = f"{ARENA}/api/v1/data/proxy/polymarket-gamma"
-ARENA_KEY        = "FILL IN YOUR ARENA KEY HERE"   # mint at https://staging.stair-ai.com/api-keys
+ARENA_KEY        = "FILL IN YOUR ARENA KEY HERE"   # mint at https://stair-ai.com/api-keys
 # Staging shares a single publishable Supabase key for every builder — no
 # per-account JWT, no extra setup. The arena will publish these two values
 # alongside the API key minted in the portal.
@@ -758,8 +758,7 @@ print(json.dumps(polymarket_digest, indent=2))
 # In[49]:
 
 
-H_PUBLIC = {"apikey": SUPABASE_KEY}                                       # default schema = public
-H_WCA    = {"apikey": SUPABASE_KEY, "Accept-Profile": "world_cup_arena"}  # data layer
+H_WCA = {"apikey": SUPABASE_KEY, "Accept-Profile": "world_cup_arena"}  # data layer
 
 # Sportmonks side: each participant exposes a team_id (`p["id"]`). The StatsBomb
 # tables under the world_cup_arena schema key on a different country_id, so we
@@ -771,14 +770,14 @@ print("Sub-step 4b will resolve each to its dim_country.country_id.")
 
 
 # ### 4a · Discover what data exists
-# 
-# A good agent that's new to a database **asks what's there first** instead of guessing table names. The arena exposes a self-describing catalog in the `public` schema — one query tells you the tables, their categories, row counts, and descriptions (and, via the columns view, every column's type and meaning). No external docs required.
-# 
-# | View | What it returns |
+#
+# A good agent that's new to a database **asks what's there first** instead of guessing table names. The arena exposes a self-describing catalog right inside the `world_cup_arena` schema — one query tells you the tables, their categories, row counts, and descriptions (and, via the columns table, every column's type and meaning). No external docs required.
+#
+# | Object | What it returns |
 # |------|-----------------|
-# | `public.catalog_tables` | All available tables and a description of each |
-# | `public.catalog_columns` | All columns across every table, with types and descriptions |
-# | `public.catalog_full` | Both combined — tables and their columns in one response |
+# | `world_cup_arena.catalog_tables` | All available tables and a description of each |
+# | `world_cup_arena.catalog_columns` | All columns across every table, with types and descriptions |
+# | `world_cup_arena.catalog_full` | Both combined — tables and their columns in one response |
 # 
 # Below we read `catalog_full`, print every table, then pick **one** priors table (`ads_a_country_style`, which has playing-style indicators) for the example. A real agent could pull several (head-to-head, knockout patterns, etc.) — same pattern, just more rows.
 
@@ -794,7 +793,7 @@ r = requests.get(
         "select": "table_name,category,row_count,table_description,columns",
         "order":  "category,table_name",
     },
-    headers=H_PUBLIC, timeout=10,
+    headers=H_WCA, timeout=30,    # 30s buffer for Supabase serverless cold-start
 )
 r.raise_for_status()
 catalog = r.json()
@@ -804,7 +803,8 @@ for t in catalog:
     desc   = (t.get("table_description") or "-").replace("\n", " ")[:60]
     cat    = t.get("category") or "?"
     n_cols = len(t.get("columns") or [])
-    print(f"  [{cat:11s}] {t['table_name']:30s}  rows={t['row_count']:>5d}  cols={n_cols:>2d}  - {desc}")
+    rows_s = f"{t['row_count']:>5d}" if t.get("row_count") is not None else "    ?"
+    print(f"  [{cat:11s}] {t['table_name']:30s}  rows={rows_s}  cols={n_cols:>2d}  - {desc}")
 
 # For this example we fetch ONE table, picked from the list above for its
 # playing-style indicators. A real agent could pull more (H2H, KO pattern,
@@ -830,7 +830,7 @@ r = requests.get(
         "select":  "team_id,country_id,country_name",
         "team_id": f"in.({home['id']},{away['id']})",
     },
-    headers=H_WCA, timeout=10,
+    headers=H_WCA, timeout=30,
 )
 r.raise_for_status()
 country_rows       = r.json()
@@ -853,7 +853,7 @@ print(f"  {away['name']:20s} (team_id {away['id']}) -> dim_country.country_id = 
 r = requests.get(
     f"{SUPABASE}/rest/v1/{WANTED_TABLE}",
     params={"country_id": f"in.({COUNTRY_A_ID},{COUNTRY_B_ID})", "select": "*"},
-    headers=H_WCA, timeout=10,
+    headers=H_WCA, timeout=30,
 )
 r.raise_for_status()
 priors_rows = r.json()
@@ -1082,6 +1082,7 @@ STRATEGY_SYS = (
     "     5¢ slippage buffer. If the resulting size is < $1.00, skip — Polymarket's CLOB\n"
     "     enforces a $1 minimum order, so smaller orders just get rejected.\n"
     "     Round size to cents.\n"
+    "     HARD CAP: never exceed $2.00 per trade, regardless of edge or confidence.\n"
     "  4. limit_price is the worst price per share you'll accept. For long, a bit ABOVE the\n"
     "     current mid for the YES token (e.g. mid 0.665 → limit 0.68). For short, a bit\n"
     "     ABOVE the current mid for the NO token, which is (1 − mid_yes) (e.g. mid_yes 0.665\n"
@@ -1147,6 +1148,13 @@ elif strategy:
 
 order_payload  = None
 order_response = None
+# Polling-result variables — set inside the order-tracking block below when a
+# trade actually happens, but initialized here so Step 8's Acting record can
+# always read them without a NameError on the no-trade / short / 404 paths.
+final_status   = None    # arena order status after polling: filled | closed | rejected | pending | ...
+tx_hash        = None    # on-chain settlement tx hash (from the first fill)
+clob_order_id  = None    # Polymarket CLOB's id for the order
+reject_reason  = None    # arena's rejection_reason if final_status==rejected
 
 if strategy and strategy.get("should_trade"):
     # Translate the strategy's (outcome, direction) into a team_code to long.
@@ -1195,9 +1203,6 @@ if strategy and strategy.get("should_trade"):
                 # round-trips to the live Polymarket CLOB; on a freshly funded
                 # wallet a fill typically lands in 5-15s, but allow up to ~30s.
                 final_status   = order_response.get("status")
-                tx_hash        = None
-                clob_order_id  = None
-                reject_reason  = None
                 for i in range(6):                # 6 × 5s = 30s
                     time.sleep(5)
                     got = requests.get(
@@ -1377,6 +1382,24 @@ else:
 
 
 LEDGER_SESSION_ID = f"prematch:{SPORTMONKS_FIXTURE_ID}:{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+
+# Bind the session_id to this fixture server-side. The records batch we POST
+# below carries session_id on every record, but the arena also needs an
+# explicit (session_id -> fixture_id) link to score the predictions later.
+# Idempotent: re-binding the same session to the same fixture is a no-op.
+bind_r = requests.post(
+    f"{ARENA}/api/v1/arena/ledger/sessions/{LEDGER_SESSION_ID}/fixture",
+    headers={**H_ARENA, "content-type": "application/json"},
+    json={"fixture_id": str(SPORTMONKS_FIXTURE_ID)},
+    timeout=10,
+)
+if bind_r.ok:
+    print(f"HTTP {bind_r.status_code} (OK) -- session bound to fixture: "
+          f"{bind_r.json()}")
+else:
+    print(f"HTTP {bind_r.status_code} -- session->fixture bind failed: "
+          f"{bind_r.text[:300]}")
+
 
 def _new_record(behavior, **fields):
     """Compose the BaseRecord envelope + behavior-specific fields.
@@ -1648,25 +1671,43 @@ records = [
     rec_th_predict, rec_act_predict, rec_th_strategy,
 ]
 
-# (13) Acting — emit only when the agent actually submitted an order.
-# This is the AGENT-side Acting (intent / submission). The arena will
-# additionally write its own Acting record(s) server-side at fill / close
-# time with target_system="public-chain" + execution_id=<tx_hash>. The two
-# are independent evidence of the same logical action.
-if strategy and strategy.get("should_trade"):
-    # Did the order POST land cleanly? If yes, status=pending (waiting on fill);
-    # if not, status=failed. order_response is None on 404 / exception.
+# (13) Acting — emit only when the agent actually built + submitted an order.
+# Step 7 skips the order build for "short" strategies under the new buy-YES-only
+# contract, so `order_payload` may be None even when should_trade=True. Guarding
+# on both avoids logging an Acting record with parameters=null (which the
+# ledger rejects). This is the AGENT-side Acting (intent / submission); the
+# arena will additionally write its own Acting record(s) server-side at fill /
+# close time with target_system="public-chain" + execution_id=<tx_hash>.
+if strategy and strategy.get("should_trade") and order_payload is not None:
+    # Did the order POST land cleanly? Required precondition for anything but
+    # "failed" — order_response is None on 404 / exception.
     submitted_ok = isinstance(order_response, dict) and bool(order_response)
+    # Map the polled order outcome to the schema's Acting.execution_status enum
+    # (confirmed | failed | simulated | pending):
+    #   filled                       -> confirmed
+    #   closed AND tx_hash           -> confirmed   (settled on-chain)
+    #   closed AND no tx_hash        -> failed      (cancelled / expired)
+    #   rejected                     -> failed
+    #   non-terminal after polling   -> pending     (server-side fill-time Acting will supersede)
+    #   POST never landed            -> failed
+    if   final_status == "filled" or (final_status == "closed" and tx_hash):
+        exec_status = "confirmed"
+    elif final_status in ("closed", "rejected"):
+        exec_status = "failed"
+    elif submitted_ok:
+        exec_status = "pending"
+    else:
+        exec_status = "failed"
     rec_act = _new_record(
         "Acting",
         upstream_record_id=[rec_th_strategy["record_id"]],
         action_type=     "open_order",
         target_system=   "arena",     # we submit to arena; arena routes to polymarket-clob
-        action_summary=  (f"Open {strategy['direction']} ${strategy['size_usdc']:.2f} on "
-                          f"{strategy['outcome']} @ ≤{strategy['limit_price']}"),
+        action_summary=  (f"Open ${strategy['size_usdc']:.2f} YES on "
+                          f"{order_payload['team_code']} @ ≤{order_payload['limit_price']}"),
         parameters=      order_payload,
         dry_run=         False,
-        execution_status="pending" if submitted_ok else "failed",
+        execution_status=exec_status,
         execution_id=    (order_response.get("order_id") if submitted_ok else None),
     )
     records.append(rec_act)
@@ -1688,6 +1729,32 @@ PAYLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
 PAYLOAD_PATH.write_text(json.dumps({"records": records}, indent=2, default=str))
 print(f"\nPayload saved to {PAYLOAD_PATH} "
       f"({len(records)} records, {PAYLOAD_PATH.stat().st_size} bytes)")
+
+# Pre-validate via /records/validate before the batch POST. Cheap server-side
+# schema check; surfaces obvious structural issues (missing required fields,
+# bad enums, etc.) without the side effect of creating real records. Non-
+# blocking: if validate raises any issue we print and still submit, since the
+# batch endpoint is the authoritative gate.
+print(f"\nValidating {len(records)} records before submission...")
+try:
+    v = requests.post(
+        f"{ARENA}/api/v1/arena/ledger/records/validate",
+        headers=H_ARENA, timeout=30,
+        json={"records": records},
+    )
+    if v.ok:
+        vbody = v.json()
+        if vbody.get("valid") and not vbody.get("errors"):
+            print(f"  HTTP {v.status_code} -- valid: {len(records)}/{len(records)} records OK.")
+        else:
+            print(f"  HTTP {v.status_code} -- valid={vbody.get('valid')}, "
+                  f"errors={len(vbody.get('errors') or [])}")
+            for e in vbody.get("errors") or []:
+                print(f"    {e}")
+    else:
+        print(f"  HTTP {v.status_code} -- validate rejected. Body: {v.text[:500]}")
+except Exception as e:
+    print(f"  Validate POST failed (non-blocking): {type(e).__name__}: {e}")
 
 # Submit the trace as a single batch. Per the new ledger contract:
 #   - No session-create endpoint; session_id is purely a client-side string.
