@@ -69,13 +69,13 @@ ARENA            = "https://stair-ai.com"
 SPORTMONKS_PROXY = f"{ARENA}/api/v1/data/proxy/sportmonks/v3/football"
 POLYMARKET_CLOB  = f"{ARENA}/api/v1/data/proxy/polymarket-clob"
 POLYMARKET_GAMMA = f"{ARENA}/api/v1/data/proxy/polymarket-gamma"
-ARENA_KEY        = "FILL IN YOUR ARENA KEY HERE"   # mint at https://stair-ai.com/api-keys
+ARENA_KEY        = "FILL IN YOUR ARENA KEY HERE"   # get this from https://stair-ai.com/api-keys
 # Staging shares a single publishable Supabase key for every builder — no
 # per-account JWT, no extra setup. The arena will publish these two values
-# alongside the API key minted in the portal.
+    # alongside the API key minted in the portal.
 SUPABASE         = "https://ezvbmtvrvzageqixvdak.supabase.co"
 SUPABASE_KEY     = "sb_publishable__m8bOkD05ToFwATpaWST5w_2-3fGS7V"
-ANTHROPIC_KEY    = "FILL IN YOUR ANTHROPIC KEY HERE"   # get one at https://console.anthropic.com
+ANTHROPIC_KEY    = "FILL IN YOUR ANTHROPIC KEY HERE"  # get this from https://console.anthropic.com/api-keys
 
 # --- Other LLM providers (OPTIONAL) ------------------------------------------
 # This notebook calls Anthropic by default. To use a DIFFERENT provider instead:
@@ -650,10 +650,14 @@ else:
                 except json.JSONDecodeError:
                     token_ids = []
                 token_yes = token_ids[0] if token_ids else None
+                # Use Sportmonks-side short codes (e.g. ZAF, not Polymarket's
+                # RSA) so the same team_code flows from this digest into the
+                # strategy LLM and onward to the arena /orders endpoint, which
+                # validates team_code against Sportmonks codes.
                 outcomes[key] = {
                     "team_code":       key if key == "draw" else (
-                                            pm_home_code.upper() if key == "home"
-                                            else pm_away_code.upper()),
+                                            home["short_code"] if key == "home"
+                                            else away["short_code"]),
                     "condition_id":    mkt.get("conditionId"),
                     "token_yes":       token_yes,
                     "current_mid_yes": _clob_mid(token_yes),  # 3b · one CLOB call per YES token
@@ -1054,55 +1058,77 @@ if wallet.get("polymarket_profile_url"):
 STRATEGY_SYS = (
     "You are a bankroll manager for an agent's USDC wallet. You receive the "
     "agent's own prediction, the current Polymarket market view, and the agent's "
-    "available wallet balance — and decide whether to trade and on what terms.\n\n"
+    "available wallet balance — and decide which specific buy-YES orders to "
+    "place (or skip entirely).\n\n"
+
+    "## Key constraint: Polymarket is BUY-YES ONLY\n"
+    "You cannot sell or short. To FADE an outcome X you have to buy YES on the "
+    "OTHER two outcomes — that bundle pays off iff X loses. So every decision "
+    "is expressed as zero, one, or two buy-YES orders. There is no 'short' in "
+    "the output.\n\n"
 
     "## Input shape\n"
     "  - prediction              : {outcome, probability, confidence_level, rationale, …}\n"
     "                              The agent's own view, formed without seeing the market.\n"
     "  - polymarket_digest       : {implied_win_prob, sum_implied_prob, execution_handles,\n"
     "                              market_handle, data_availability, summary}.\n"
-    "                              The market's view (implied_win_prob keys match team codes).\n"
+    "                              The market's view (implied_win_prob keys match team codes,\n"
+    "                              with the third key always 'draw'). Each value is the YES\n"
+    "                              mid (= implied probability) of that outcome.\n"
     "  - available_balance_usdc  : float, the agent's spendable USDC right now\n"
     "                              (from /v1/arena/agents/me). Locked balance is excluded.\n\n"
 
     "## How to decide\n"
     "  1. Edge = prediction.probability − polymarket_digest.implied_win_prob[prediction.outcome]\n"
-    "     (in percentage points). Positive edge = market UNDER-prices the pick → long.\n"
-    "     Negative edge = market OVER-prices the pick → short.\n"
-    "  2. Base size (before wallet cap), tuned to a notional $100 bankroll:\n"
-    "       |edge| < 5pp                  → don't trade (noise)\n"
+    "     (in percentage points). Positive edge = market UNDER-prices the pick (back it).\n"
+    "     Negative edge = market OVER-prices the pick (fade it).\n"
+    "     If |edge| < 5pp, skip — noise.\n"
+    "  2. Base TOTAL size (before caps), tuned to a notional $100 bankroll:\n"
     "       |edge| 5-15pp                 → $1-2  (modest position)\n"
     "       |edge| > 15pp                 → $3-5  (high-conviction position)\n"
-    "     Then HALVE the size if confidence_level is 'low'.\n"
-    "       confidence 'medium'           → use the size above\n"
-    "       confidence 'high'             → use up to 1.5× (capped at $5)\n"
-    "     If the Polymarket digest's data_availability is not 'mids_available', skip — you\n"
-    "     can't price an edge without mids.\n"
-    "  3. WALLET CAP: cap the final size at (available_balance_usdc − 0.05) so we leave a\n"
-    "     5¢ slippage buffer. If the resulting size is < $1.00, skip — Polymarket's CLOB\n"
-    "     enforces a $1 minimum order, so smaller orders just get rejected.\n"
-    "     Round size to cents.\n"
-    "     HARD CAP: never exceed $2.00 per trade, regardless of edge or confidence.\n"
-    "  4. limit_price is the worst price per share you'll accept. For long, a bit ABOVE the\n"
-    "     current mid for the YES token (e.g. mid 0.665 → limit 0.68). For short, a bit\n"
-    "     ABOVE the current mid for the NO token, which is (1 − mid_yes) (e.g. mid_yes 0.665\n"
-    "     → NO_mid 0.335 → limit 0.36).\n\n"
+    "     Then HALVE the size if confidence_level is 'low'; use up to 1.5× if 'high'.\n"
+    "     If data_availability is not 'mids_available', skip — you can't price an edge\n"
+    "     without mids.\n"
+    "  3. CAP the final TOTAL size at min($5.00, available_balance_usdc − 0.05). The\n"
+    "     $5.00 is a hard per-cycle ceiling; the wallet term leaves a 5¢ slippage\n"
+    "     buffer. If the cap is below $1.00, skip — Polymarket's CLOB enforces a $1\n"
+    "     minimum PER ORDER, so anything smaller is just rejected. Round to cents.\n"
+    "  4. Build the orders:\n"
+    "       POSITIVE EDGE → emit ONE order:\n"
+    "         team_code   = prediction.outcome\n"
+    "         usd_size    = the capped total\n"
+    "         limit_price = current YES mid + 0.02, rounded to cents (cap 0.99)\n"
+    "       NEGATIVE EDGE → emit TWO orders, one per OTHER outcome (call them Y and Z):\n"
+    "         Split the total proportional to their YES mids:\n"
+    "             size_Y = total × mid_Y / (mid_Y + mid_Z)\n"
+    "             size_Z = total × mid_Z / (mid_Y + mid_Z)\n"
+    "         This gives the same payoff per dollar whether Y or Z wins (a synthetic\n"
+    "         fade of prediction.outcome).\n"
+    "         IMPORTANT: each individual order must be ≥ $1.00 (CLOB minimum). If a\n"
+    "         split would put either side below $1.00, scale BOTH up just enough so\n"
+    "         the smaller side hits exactly $1.00. If that scaled total exceeds the\n"
+    "         cap from step 3, SKIP — wallet too thin to fade safely.\n"
+    "         For each order: limit_price = its own YES mid + 0.02, rounded to cents.\n"
+    "         Round each usd_size to cents.\n\n"
 
     "## Output schema (return ONLY this JSON — no prose, no code fences)\n"
     "{\n"
-    "  'should_trade'   : bool,\n"
-    "  'outcome'        : str,                    // echo prediction.outcome — what to trade\n"
-    "  'direction'      : 'long' | 'short',       // long = back the outcome; short = fade it\n"
-    "  'size_usdc'      : float,                  // 0 when not trading; ≤ available_balance_usdc − 0.05\n"
-    "  'limit_price'    : float,                  // 0..1; see rule 4 above\n"
-    "  'edge_pp'        : float,                  // (agent_prob − market_prob) × 100\n"
-    "  'market_handle'  : str,                    // echo polymarket_digest.market_handle for traceability\n"
-    "  'rationale'      : str                     // 1-3 sentences self-contained: state the edge,\n"
-    "                                             // the size logic (including wallet cap if applied),\n"
-    "                                             // the limit_price logic.\n"
+    "  'should_trade'   : bool,                              // false when we skip\n"
+    "  'orders'         : [                                  // 0, 1, or 2 items\n"
+    "      {\n"
+    "        'team_code'   : str,                            // home_code | 'draw' | away_code\n"
+    "        'usd_size'    : float,                          // ≥ $1.00 per order; rounded to cents\n"
+    "        'limit_price' : float                           // 0..1; YES mid + ~0.02; rounded to cents\n"
+    "      }, ...\n"
+    "  ],\n"
+    "  'edge_pp'        : float,                             // (agent_prob − market_prob) × 100\n"
+    "  'market_handle'  : str,                               // echo polymarket_digest.market_handle\n"
+    "  'rationale'      : str                                // 1-3 sentences: the edge, the sizing\n"
+    "                                                       // decision, and (for two-order fades)\n"
+    "                                                       // the split math you computed.\n"
     "}\n\n"
 
-    "Be conservative: thin wallet, weak conviction → skipping is a valid answer."
+    "Be conservative: thin wallet, weak conviction, or no mids → skipping is a valid answer."
 )
 
 strategy_input = json.dumps({
@@ -1118,71 +1144,62 @@ strategy = json.loads(m.group(0)) if m else None
 print(f"The agent decided on a strategy "
       f"({len(llm_strategy.internal_reasoning)} chars of thinking):\n")
 print(json.dumps(strategy, indent=2))
-if strategy and strategy.get("should_trade"):
-    print(f"\n-> In plain words: {strategy['direction'].upper()} ${strategy['size_usdc']:.2f} on "
-          f"'{strategy['outcome']}' (edge {strategy['edge_pp']:+.1f} points).")
+if strategy and strategy.get("should_trade") and strategy.get("orders"):
+    print(f"\n-> {len(strategy['orders'])} order(s) at edge "
+          f"{strategy.get('edge_pp', 0):+.1f} pp:")
+    for o in strategy["orders"]:
+        print(f"   BUY ${o['usd_size']:.2f} YES of {o['team_code']:>5s} "
+              f"@ ≤{o['limit_price']:.2f}")
 elif strategy:
     print(f"\n-> In plain words: no trade -- edge {strategy.get('edge_pp', 0):+.1f} points "
           f"isn't worth it for this wallet.")
 
 
-# ## Step 7 · Place the bet (open a position)
+# ## Step 7 · Place the bet (open positions)
 #
 # Two sub-steps:
 #
 # | Sub-step | What it does |
 # |----------|--------------|
-# | **7a · Order**    | Build + POST the order (skipped if Step 6 said don't trade) |
-# | **7b · Exposure** | After the order, GET `/v1/arena/exposure` to confirm the position |
+# | **7a · Orders**   | Build + POST each order Step 6b emitted (zero, one, or two — fades become two synthetic buy-YES orders) |
+# | **7b · Exposure** | After the orders, GET `/v1/arena/exposure` to confirm the positions |
 #
-# An **idempotency key** (a random UUID) is included in the order so that retrying the same request can't accidentally place it twice. **Predict-only runs are fully supported** — if Step 6 said skip, 7a prints a notice and 7b still runs so we can see existing positions.
+# Each order has its own random-UUID idempotency key so retries can't double-post. **Predict-only runs are fully supported** — if Step 6b emitted zero orders, 7a prints a notice and 7b still runs so we can see existing positions.
 
-# ### 7a · Build and submit the order
+# ### 7a · Build and submit the order(s)
 #
-# If Step 6 decided to trade, we build an order and POST it to the arena. If it decided to skip, we do nothing — predict-only runs are fully supported, and the reasoning still gets recorded in Step 8.
+# Step 6b emits zero, one, or two orders. When the strategy fades an outcome it emits **two** buy-YES orders on the OTHER two outcomes (Polymarket has no native sell/short), and we submit them as independent POSTs to `/v1/arena/orders`. Each order has its own idempotency key, its own polling loop, and — in Step 8 — its own Acting record.
 #
-# Either way we print the order payload so you can see its shape. (The arena `/orders` endpoint may not be live on staging yet, so the POST can 404 — that's expected here.)
+# (The arena `/orders` endpoint may 404 on some deploys; in that case the local payloads still get logged and the ledger Acting records still describe the intent.)
 
 # In[40]:
 
 
-order_payload  = None
-order_response = None
-# Polling-result variables — set inside the order-tracking block below when a
-# trade actually happens, but initialized here so Step 8's Acting record can
-# always read them without a NameError on the no-trade / short / 404 paths.
-final_status   = None    # arena order status after polling: filled | closed | rejected | pending | ...
-tx_hash        = None    # on-chain settlement tx hash (from the first fill)
-clob_order_id  = None    # Polymarket CLOB's id for the order
-reject_reason  = None    # arena's rejection_reason if final_status==rejected
+order_payloads  = []    # one payload per order we attempted to submit
+order_responses = []    # parallel: /orders POST response body (or None on 404/exception)
+order_outcomes  = []    # parallel: {final_status, tx_hash, clob_order_id, reject_reason} per order
 
-if strategy and strategy.get("should_trade"):
-    # Translate the strategy's (outcome, direction) into a team_code to long.
-    # "long X"  -> team_code = X
-    # "short X" -> we'd need to pick which alternative outcome to long instead;
-    #              the strategy LLM doesn't tell us which one, so skip and
-    #              flag. Update STRATEGY_SYS to emit team_code directly if you
-    #              want to enable shorts (just pick the cheaper of the two
-    #              non-X outcomes from polymarket_digest.implied_win_prob).
-    if strategy.get("direction") == "long":
-        team_code = strategy["outcome"]
-    else:
-        team_code = None
-        print(f"Strategy says SHORT {strategy['outcome']} -- the new order API only "
-              f"supports buy-YES. Skipping order. (To enable shorts, update the "
-              f"strategy LLM to emit team_code for the alternative outcome to long.)")
+orders_to_place = (strategy or {}).get("orders") or []
 
-    if team_code is not None:
+if strategy and strategy.get("should_trade") and orders_to_place:
+    print(f"\nStrategy says TRADE: submitting {len(orders_to_place)} order(s).")
+    for idx, ord_spec in enumerate(orders_to_place, start=1):
         order_payload = {
-            "fixture_code":           str(SPORTMONKS_FIXTURE_ID),
-            "team_code":              team_code,
-            "usd_size":               f"{strategy['size_usdc']:.2f}",
-            "limit_price":            strategy["limit_price"],
+            "fixture_id":             str(SPORTMONKS_FIXTURE_ID),
+            "team_code":              ord_spec["team_code"],
+            "usd_size":               f"{float(ord_spec['usd_size']):.2f}",
+            "limit_price":            ord_spec["limit_price"],
             "time_in_force_seconds":  30,
             "idempotency_key":        str(uuid.uuid4()),
         }
-        print("\nStrategy says TRADE. Here's the exact order we'd submit:\n")
+        order_payloads.append(order_payload)
+        print(f"\n--- Order {idx}/{len(orders_to_place)} ---")
         print(json.dumps(order_payload, indent=2))
+
+        # Per-order outcome tracker; populated when the POST + polling lands cleanly.
+        outcome = {"final_status": None, "tx_hash": None,
+                   "clob_order_id": None, "reject_reason": None}
+        order_response = None
         try:
             r = requests.post(
                 f"{ARENA}/api/v1/arena/orders",
@@ -1190,20 +1207,18 @@ if strategy and strategy.get("should_trade"):
                 json=order_payload,
             )
             if r.status_code == 404:
-                print("\nHTTP 404 -- /arena/orders not live on this deploy yet. "
-                      "Expected on staging-in-progress; payload above is what a real run would send.")
+                print(f"HTTP 404 -- /arena/orders not live on this deploy yet. "
+                      f"Payload above is what a real run would send.")
             elif r.ok:
                 order_response = r.json()
                 order_id = order_response.get("order_id")
-                print(f"\nHTTP {r.status_code} (OK) -- order accepted "
+                print(f"HTTP {r.status_code} (OK) -- order accepted "
                       f"(order_id={order_id}, status={order_response.get('status')}, "
                       f"locked=${order_response.get('size_usdc_locked')}).")
 
-                # Poll the order to a terminal state. The execution worker
-                # round-trips to the live Polymarket CLOB; on a freshly funded
-                # wallet a fill typically lands in 5-15s, but allow up to ~30s.
-                final_status   = order_response.get("status")
-                for i in range(6):                # 6 × 5s = 30s
+                # Poll THIS order to a terminal state. 6 × 5s = up to 30s.
+                outcome["final_status"] = order_response.get("status")
+                for i in range(6):
                     time.sleep(5)
                     got = requests.get(
                         f"{ARENA}/api/v1/arena/orders/{order_id}",
@@ -1212,31 +1227,34 @@ if strategy and strategy.get("should_trade"):
                     if not got.ok:
                         continue
                     d = got.json()
-                    final_status  = d.get("status")
-                    reject_reason = d.get("rejection_reason") or reject_reason
-                    fills         = d.get("open_fills") or []
+                    outcome["final_status"]  = d.get("status")
+                    outcome["reject_reason"] = d.get("rejection_reason") or outcome["reject_reason"]
+                    fills = d.get("open_fills") or []
                     if fills:
-                        tx_hash       = fills[0].get("tx_hash")       or tx_hash
-                        clob_order_id = fills[0].get("clob_order_id") or clob_order_id
-                    print(f"  poll {i+1}: status={final_status}  filled=${d.get('size_usdc_filled')}")
-                    if final_status in ("closed", "filled", "rejected"):
+                        outcome["tx_hash"]       = fills[0].get("tx_hash")       or outcome["tx_hash"]
+                        outcome["clob_order_id"] = fills[0].get("clob_order_id") or outcome["clob_order_id"]
+                    print(f"  poll {i+1}: status={outcome['final_status']}  "
+                          f"filled=${d.get('size_usdc_filled')}")
+                    if outcome["final_status"] in ("closed", "filled", "rejected"):
                         break
 
-                if final_status in ("filled", "closed"):
-                    if tx_hash:
-                        print(f"\nFilled. On-chain settlement tx:\n  https://polygonscan.com/tx/{tx_hash}")
-                    if clob_order_id:
-                        print(f"CLOB order id: {clob_order_id}")
-                elif final_status == "rejected":
-                    print(f"\nOrder rejected. reason: {reject_reason or '(none reported)'}")
-                else:
-                    print(f"\nOrder still '{final_status}' after 30s -- check the dashboard for the final state.")
+                if outcome["final_status"] in ("filled", "closed") and outcome["tx_hash"]:
+                    print(f"  Filled. On-chain settlement tx: "
+                          f"https://polygonscan.com/tx/{outcome['tx_hash']}")
+                elif outcome["final_status"] == "rejected":
+                    print(f"  Rejected. reason: {outcome['reject_reason'] or '(none reported)'}")
+                elif outcome["final_status"] not in ("filled", "closed"):
+                    print(f"  Status '{outcome['final_status']}' after 30s -- "
+                          f"check the dashboard for the final state.")
             else:
-                print(f"\nHTTP {r.status_code} -- order rejected. Body: {r.text[:300]}")
+                print(f"HTTP {r.status_code} -- order rejected. Body: {r.text[:300]}")
         except Exception as e:
-            print(f"\nOrder POST failed: {type(e).__name__}: {e}")
+            print(f"Order POST failed: {type(e).__name__}: {e}")
+
+        order_responses.append(order_response)
+        order_outcomes.append(outcome)
 else:
-    print("Strategy says DON'T trade, so we skip placing an order.")
+    print("Strategy says DON'T trade (or emitted zero orders) -- skipping order placement.")
     print("Predict-only runs are fully supported -- Step 8 still records everything.")
 
 
@@ -1671,18 +1689,20 @@ records = [
     rec_th_predict, rec_act_predict, rec_th_strategy,
 ]
 
-# (13) Acting — emit only when the agent actually built + submitted an order.
-# Step 7 skips the order build for "short" strategies under the new buy-YES-only
-# contract, so `order_payload` may be None even when should_trade=True. Guarding
-# on both avoids logging an Acting record with parameters=null (which the
-# ledger rejects). This is the AGENT-side Acting (intent / submission); the
-# arena will additionally write its own Acting record(s) server-side at fill /
-# close time with target_system="public-chain" + execution_id=<tx_hash>.
-if strategy and strategy.get("should_trade") and order_payload is not None:
+# (13) Acting — ONE record per order Step 7a actually attempted to submit.
+# Step 6b can emit 0, 1, or 2 orders (a "fade" emits two synthetic buy-YES
+# orders), so this is a loop over `order_payloads` / `order_responses` /
+# `order_outcomes`. These are the AGENT-side Acting records (intent /
+# submission); the arena will additionally write its own Acting record(s)
+# server-side at fill / close time with target_system="public-chain" +
+# execution_id=<tx_hash> for the on-chain settlement evidence.
+for op, resp, outcome in zip(order_payloads, order_responses, order_outcomes):
     # Did the order POST land cleanly? Required precondition for anything but
-    # "failed" — order_response is None on 404 / exception.
-    submitted_ok = isinstance(order_response, dict) and bool(order_response)
-    # Map the polled order outcome to the schema's Acting.execution_status enum
+    # "failed" — resp is None on 404 / exception.
+    submitted_ok = isinstance(resp, dict) and bool(resp)
+    fs = outcome["final_status"]
+    tx = outcome["tx_hash"]
+    # Map this order's polled outcome -> Acting.execution_status enum
     # (confirmed | failed | simulated | pending):
     #   filled                       -> confirmed
     #   closed AND tx_hash           -> confirmed   (settled on-chain)
@@ -1690,9 +1710,9 @@ if strategy and strategy.get("should_trade") and order_payload is not None:
     #   rejected                     -> failed
     #   non-terminal after polling   -> pending     (server-side fill-time Acting will supersede)
     #   POST never landed            -> failed
-    if   final_status == "filled" or (final_status == "closed" and tx_hash):
+    if   fs == "filled" or (fs == "closed" and tx):
         exec_status = "confirmed"
-    elif final_status in ("closed", "rejected"):
+    elif fs in ("closed", "rejected"):
         exec_status = "failed"
     elif submitted_ok:
         exec_status = "pending"
@@ -1703,12 +1723,12 @@ if strategy and strategy.get("should_trade") and order_payload is not None:
         upstream_record_id=[rec_th_strategy["record_id"]],
         action_type=     "open_order",
         target_system=   "arena",     # we submit to arena; arena routes to polymarket-clob
-        action_summary=  (f"Open ${strategy['size_usdc']:.2f} YES on "
-                          f"{order_payload['team_code']} @ ≤{order_payload['limit_price']}"),
-        parameters=      order_payload,
+        action_summary=  (f"Open ${float(op['usd_size']):.2f} YES on "
+                          f"{op['team_code']} @ ≤{op['limit_price']}"),
+        parameters=      op,
         dry_run=         False,
         execution_status=exec_status,
-        execution_id=    (order_response.get("order_id") if submitted_ok else None),
+        execution_id=    (resp.get("order_id") if submitted_ok else None),
     )
     records.append(rec_act)
 
